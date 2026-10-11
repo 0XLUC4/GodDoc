@@ -1,6 +1,7 @@
-# GodDoc
+<p align="center"><img src="assets/logo.png" width="160" alt="GodDoc logo"></p>
 
-Pure-Rust word processor, sibling of GodPDF (same monochrome shell).
+<h1 align="center">GodDoc</h1>
+<p align="center">A word processor in pure Rust. Local: no account, no cloud.</p>
 
 <p align="center"><img src="docs/screenshot.png" alt="GodDoc with a document open" width="900"></p>
 
