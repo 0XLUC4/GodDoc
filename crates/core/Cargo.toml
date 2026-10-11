@@ -1,0 +1,12 @@
+[package]
+name = "goddoc-core"
+description = "GodDoc document model and .docx reading / writing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+thiserror.workspace = true
+quick-xml = "0.37"
+# Deflate through miniz_oxide: no C code.
+zip = { version = "2", default-features = false, features = ["deflate"] }
