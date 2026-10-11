@@ -1036,7 +1036,10 @@ impl GodApp {
         let tab = &self.tabs[self.active];
         let format = tab.current();
         let para = tab.doc.paras()[tab.doc.para_at(tab.selection.start)];
-        let row = vec2(ui.available_width(), BAR_HEIGHT);
+        // In a bar that scrolls sideways the width on offer has no end: the tools then
+        // take what they need.
+        let wide = Some(ui.available_width()).filter(|wide| wide.is_finite());
+        let row = vec2(wide.unwrap_or(0.0), BAR_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             ui.add_space(6.0);
@@ -1353,7 +1356,10 @@ impl GodApp {
         let para = tab.para();
         let page = tab.doc.page;
         let edit = |edit: Edit| Cmd::Edit(edit);
-        let row = vec2(ui.available_width(), BAR_HEIGHT);
+        // In a bar that scrolls sideways the width on offer has no end: the tools then
+        // take what they need.
+        let wide = Some(ui.available_width()).filter(|wide| wide.is_finite());
+        let row = vec2(wide.unwrap_or(0.0), BAR_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
             let p = &palette;
@@ -1825,7 +1831,16 @@ impl eframe::App for GodApp {
                         .fill(palette.bg)
                         .inner_margin(Margin::symmetric(10, 0)),
                 )
-                .show(ui, |ui| self.ribbon(ui, &mut clicked));
+                .show(ui, |ui| {
+                    // A window too narrow for all the tools scrolls them sideways.
+                    // Its bar shows as soon as there is something to scroll to, not only under
+                    // the pointer.
+                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                    ui.spacing_mut().scroll.bar_width = 6.0;
+                    let bar = ScrollArea::horizontal().id_salt("ribbon");
+                    bar.auto_shrink([false, true])
+                        .show(ui, |ui| self.ribbon(ui, &mut clicked));
+                });
             if self.find.open {
                 Panel::top("find-bar")
                     .frame(
