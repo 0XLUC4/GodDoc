@@ -80,6 +80,20 @@ enum Flag {
     Strike,
 }
 
+/// Draw the interface with the font of the system (Segoe UI on Windows) when it is there;
+/// the one that comes with egui stays behind it, for what it lacks.
+fn system_ui_font(fonts: &mut egui::FontDefinitions) {
+    let folder = std::env::var_os("WINDIR").map(std::path::PathBuf::from);
+    let file = folder.map(|folder| folder.join("Fonts").join("segoeui.ttf"));
+    let Some(bytes) = file.and_then(|file| std::fs::read(file).ok()) else {
+        return;
+    };
+    let data = egui::FontData::from_owned(bytes);
+    fonts.font_data.insert("system-ui".to_owned(), data.into());
+    let family = fonts.families.entry(egui::FontFamily::Proportional);
+    family.or_default().insert(0, "system-ui".to_owned());
+}
+
 impl Flag {
     fn of(self, format: &mut Format) -> &mut bool {
         match self {
@@ -512,6 +526,7 @@ impl GodApp {
         theme::install(&cc.egui_ctx, dark);
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
+        system_ui_font(&mut fonts);
         layout::install_fonts(&mut fonts);
         cc.egui_ctx.set_fonts(fonts);
         let mut app = Self {
