@@ -2452,77 +2452,78 @@ fn quick_menu(
         highlight_swatches(ui, format.highlight, palette, clicked);
     });
     ui.separator();
-    menu_item(ui, clicked, icon::SCISSORS, "Cut", "Ctrl+X", Cmd::Cut);
-    menu_item(ui, clicked, icon::COPY, "Copy", "Ctrl+C", Cmd::Copy);
-    menu_item(ui, clicked, icon::CLIPBOARD, "Paste", "Ctrl+V", Cmd::Paste);
-    let all = icon::SELECTION_ALL;
-    menu_item(ui, clicked, all, "Select all", "Ctrl+A", Cmd::SelectAll);
     let clear = Cmd::Edit(Edit::ClearFormat);
-    menu_item(ui, clicked, icon::ERASER, "Clear formatting", "", clear);
+    let edits = [
+        (icon::SCISSORS, "Cut (Ctrl+X)", Cmd::Cut, false),
+        (icon::COPY, "Copy (Ctrl+C)", Cmd::Copy, false),
+        (icon::CLIPBOARD, "Paste (Ctrl+V)", Cmd::Paste, false),
+        (
+            icon::SELECTION_ALL,
+            "Select all (Ctrl+A)",
+            Cmd::SelectAll,
+            false,
+        ),
+        (icon::ERASER, "Clear formatting", clear, false),
+    ];
+    menu_icons(ui, clicked, &edits);
     if in_table {
         ui.separator();
-        menu_item(
-            ui,
-            clicked,
-            icon::ARROW_LINE_UP,
-            "Insert row above",
-            "",
-            Cmd::TableRow(false),
-        );
-        menu_item(
-            ui,
-            clicked,
-            icon::ARROW_LINE_DOWN,
-            "Insert row below",
-            "",
-            Cmd::TableRow(true),
-        );
-        let left = icon::ARROW_LINE_LEFT;
-        menu_item(
-            ui,
-            clicked,
-            left,
-            "Insert column left",
-            "",
-            Cmd::TableCol(false),
-        );
-        let right = icon::ARROW_LINE_RIGHT;
-        menu_item(
-            ui,
-            clicked,
-            right,
-            "Insert column right",
-            "",
-            Cmd::TableCol(true),
-        );
-        menu_item(
-            ui,
-            clicked,
-            icon::TRASH,
-            "Delete row",
-            "",
-            Cmd::DeleteLine(true),
-        );
-        menu_item(
-            ui,
-            clicked,
-            icon::TRASH,
-            "Delete column",
-            "",
-            Cmd::DeleteLine(false),
-        );
+        let table = [
+            (
+                icon::ROWS_PLUS_TOP,
+                "Insert row above",
+                Cmd::TableRow(false),
+                false,
+            ),
+            (
+                icon::ROWS_PLUS_BOTTOM,
+                "Insert row below",
+                Cmd::TableRow(true),
+                false,
+            ),
+            (
+                icon::COLUMNS_PLUS_LEFT,
+                "Insert column left",
+                Cmd::TableCol(false),
+                false,
+            ),
+            (
+                icon::COLUMNS_PLUS_RIGHT,
+                "Insert column right",
+                Cmd::TableCol(true),
+                false,
+            ),
+            (icon::ROWS, "Delete row", Cmd::DeleteLine(true), true),
+            (icon::COLUMNS, "Delete column", Cmd::DeleteLine(false), true),
+        ];
+        menu_icons(ui, clicked, &table);
     }
     if picture {
         ui.separator();
-        menu_item(
-            ui,
-            clicked,
-            icon::TRASH,
-            "Delete image",
-            "Del",
-            Cmd::DeleteImage,
-        );
+        let image = [(icon::TRASH, "Delete image (Del)", Cmd::DeleteImage, true)];
+        menu_icons(ui, clicked, &image);
     }
+}
+
+/// A row of icon buttons in a menu: (icon, what it does, its command, whether it deletes).
+/// What each does shows when the pointer rests on it; a click queues its command.
+fn menu_icons(ui: &mut Ui, clicked: &mut Vec<Cmd>, items: &[(&str, &str, Cmd, bool)]) {
+    ui.horizontal(|ui| {
+        ui.spacing_mut().item_spacing.x = 2.0;
+        for (glyph, does, cmd, deletes) in items {
+            let mut text = RichText::new(*glyph).size(16.0);
+            if *deletes {
+                text = text.color(ui.visuals().error_fg_color);
+            }
+            let button = Button::new(text)
+                .frame_when_inactive(false)
+                .stroke(egui::Stroke::NONE);
+            let button = ui.add_sized(widgets::ICON_BUTTON, button);
+            if button.on_hover_text(*does).clicked() {
+                clicked.push(*cmd);
+            }
+        }
+    });
 }
 
 /// One entry of a menu: icon, label and shortcut hint. A click queues `cmd`.

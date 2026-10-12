@@ -396,7 +396,8 @@ fn markdown(ui: &mut Ui, text: &str) {
                 ui.horizontal_top(|ui| {
                     ui.label(RichText::new("•").size(size).color(color));
                     let width = ui.available_width();
-                    ui.label(line_job(item, size, false, width));
+                    // In a row a label runs on: this one is told to go to the next line.
+                    ui.add(egui::Label::new(line_job(item, size, false, width)).wrap());
                 });
             }
             None => {
@@ -563,5 +564,21 @@ mod tests {
             Some("https://example.com/exe")
         );
         assert_eq!(releases[1].asset, None);
+    }
+
+    #[test]
+    fn a_long_item_of_the_notes_goes_on_the_next_line() {
+        let ctx = Context::default();
+        let notes = format!("- {}", "a long sentence of a release ".repeat(12));
+        let mut size = egui::Vec2::ZERO;
+        let _ = ctx.run_ui(egui::RawInput::default(), |ui| {
+            ui.scope(|ui| {
+                ui.set_width(460.0);
+                markdown(ui, &notes);
+                size = ui.min_rect().size();
+            });
+        });
+        assert!(size.x <= 461.0, "the card keeps its width, not {}", size.x);
+        assert!(size.y > 40.0, "the item takes several lines");
     }
 }

@@ -27,6 +27,8 @@ const GRIP_ZONE: f32 = 44.0;
 /// Narrowest a picture can be made, in points.
 const MIN_PICTURE: f32 = 16.0;
 const HANDLE: f32 = 9.0;
+/// What is laid over selected text.
+const SELECTION: Color32 = Color32::from_black_alpha(52);
 /// Colour of the formatting marks: seen, and not taken for text.
 const MARK_COLOR: Color32 = Color32::from_rgb(0x5B, 0x8D, 0xD6);
 /// Seconds the caret shows, then hides: the blink of Windows.
@@ -712,7 +714,8 @@ pub fn show(
         let visuals = child.visuals_mut();
         // The caret is drawn here, by `paint_caret`.
         visuals.text_cursor.stroke = Stroke::NONE;
-        visuals.selection.bg_fill = Color32::from_gray(0xC8);
+        // The selection is drawn here, by `paint_selection`.
+        visuals.selection.bg_fill = Color32::TRANSPARENT;
         visuals.selection.stroke.color = Color32::BLACK;
 
         let mut buffer = doc.text().to_owned();
@@ -721,6 +724,14 @@ pub fn show(
             .and_then(|state| state.cursor.char_range())
             .filter(|range| range.primary == range.secondary)
             .map(|range| range.primary.index.0);
+        // A right click opens the menu on what is selected: it must not move the caret.
+        let right_click = ui.input(|input| {
+            let button = egui::PointerButton::Secondary;
+            let pointer = &input.pointer;
+            pointer.button_down(button)
+                || pointer.button_pressed(button)
+                || pointer.button_released(button)
+        });
         let output = {
             let doc = &*doc;
             let mut layouter = |ui: &Ui, text: &dyn TextBuffer, _wrap: f32| {
@@ -738,6 +749,7 @@ pub fn show(
                 .margin(Margin::ZERO)
                 .desired_width(text_area.width())
                 .lock_focus(true)
+                .interactive(!right_click)
                 .layouter(&mut layouter)
                 .show(&mut child)
         };
@@ -775,6 +787,16 @@ pub fn show(
         }
         // The galley is that of the text typed: the formats are only its own once the edit is in.
         if output.galley.text() == doc.text() {
+            let focused = output.response.response.has_focus();
+            if let Some(range) = output.cursor_range.filter(|_| focused) {
+                let (a, b) = (range.primary.index.0, range.secondary.index.0);
+                let height = zoom * CARET_HEIGHT;
+                let formats = doc.formats();
+                for rect in layout::selection(&output.galley, formats, a.min(b)..a.max(b), height) {
+                    let rect = rect.translate(output.galley_pos.to_vec2());
+                    ui.painter().rect_filled(rect, 0.0, SELECTION);
+                }
+            }
             paint_underlines(ui, &output.galley, output.galley_pos, doc, zoom);
             if view.marks {
                 paint_marks(ui, &output.galley, output.galley_pos, doc, zoom);
@@ -1045,5 +1067,45 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert!(lines.iter().all(|line| line.from.y == lines[0].from.y));
         assert_eq!(lines[0].to.x, lines[1].from.x);
+    }
+
+    #[test]
+    fn a_right_click_leaves_what_is_selected_selected() {
+        let mut doc = Document::default();
+        doc.replace(0..0, "some words to mark", Format::default());
+        let mut harness = Harness::new(doc);
+        let id = Id::new("editor");
+        harness.ctx.memory_mut(|memory| memory.request_focus(id));
+        set_selection(&harness.ctx, id, Some(5), 10);
+        assert_eq!(harness.frame(Vec::new()).selection, Some(5..10));
+        // On the first line of the page, right of what is selected.
+        let pos = pos2(520.0, 108.0);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Secondary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        harness.frame(vec![Event::PointerMoved(pos)]);
+        harness.frame(vec![button(true)]);
+        harness.frame(vec![button(false)]);
+        assert_eq!(harness.menu_frames, 1, "the menu opened");
+        assert_eq!(harness.frame(Vec::new()).selection, Some(5..10));
+        // A click of the main button, away from the menu, puts the caret as ever.
+        let pos = pos2(470.0, 108.0);
+        harness.frame(vec![Event::PointerMoved(pos)]);
+        let button = |pressed| Event::PointerButton {
+            pos,
+            button: PointerButton::Primary,
+            pressed,
+            modifiers: Modifiers::NONE,
+        };
+        harness.frame(vec![button(true)]);
+        harness.frame(vec![button(false)]);
+        let caret = harness
+            .frame(Vec::new())
+            .selection
+            .expect("the page has the keyboard");
+        assert!(caret.is_empty() && caret.start > 10);
     }
 }

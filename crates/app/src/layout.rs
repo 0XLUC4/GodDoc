@@ -352,6 +352,51 @@ pub struct PageLayout {
     pub para_pages: Vec<usize>,
 }
 
+/// The boxes that mark the characters `range` of `galley` as selected, one per row: as tall as
+/// the text of the row (`text_height` per point of font size), not as the line, which line
+/// spacing makes taller.
+pub fn selection(
+    galley: &Galley,
+    formats: &[Format],
+    range: Range<usize>,
+    text_height: f32,
+) -> Vec<Rect> {
+    let mut boxes = Vec::new();
+    let mut start = 0;
+    for row in &galley.rows {
+        let first = start;
+        start += row.char_count_including_newline().0;
+        // The row holds the characters `first..start`, its line break included.
+        let (from, to) = (range.start.max(first), range.end.min(start));
+        if from >= to {
+            continue;
+        }
+        let glyphs = &row.glyphs;
+        let end = glyphs.last().map_or(0.0, |glyph| glyph.max_x());
+        let (a, b) = (from - first, (to - first).min(glyphs.len()));
+        let left = glyphs.get(a).map_or(end, |glyph| glyph.pos.x);
+        let mut right = if b > a { glyphs[b - 1].max_x() } else { left };
+        let sizes = formats.get(first..first + glyphs.len()).unwrap_or_default();
+        let largest = sizes.iter().map(|format| format.size).fold(0.0, f32::max);
+        let size = if largest > 0.0 {
+            largest
+        } else {
+            formats.get(first).map_or(11.0, |format| format.size)
+        };
+        // A selected line break shows as a little room after the text.
+        if to - first > glyphs.len() {
+            right += size * text_height * 0.3;
+        }
+        let top = row.min_y();
+        let bottom = top + row.size.y.min(size * text_height);
+        boxes.push(Rect::from_min_max(
+            pos2(row.pos.x + left, top),
+            pos2(row.pos.x + right, bottom),
+        ));
+    }
+    boxes
+}
+
 /// A formatting mark: what stands for a space, a tab or the end of a paragraph.
 pub struct Mark {
     /// Its centre, relative to the galley.
