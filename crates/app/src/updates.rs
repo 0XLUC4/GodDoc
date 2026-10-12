@@ -176,15 +176,10 @@ impl Updates {
             || "Updates".to_owned(),
             |release| format!("Update available: {}", release.tag),
         );
-        let response = ui
-            .add_sized(
-                vec2(22.0, 22.0),
-                Button::new(RichText::new(icon::ARROW_CIRCLE_UP).size(14.0))
-                    .frame_when_inactive(false),
-            )
-            .on_hover_text(tip);
+        // The same button as the others of its row: it stands in line and stays still.
+        let response = crate::widgets::icon_button(ui, icon::ARROW_CIRCLE_UP, &tip);
         if newest.is_some() {
-            let dot = response.rect.right_top() + vec2(-4.0, 4.0);
+            let dot = response.rect.right_top() + vec2(-6.0, 6.0);
             ui.painter().circle_filled(dot, 3.5, DOWNLOAD_BLUE);
         }
         if response.clicked() {
