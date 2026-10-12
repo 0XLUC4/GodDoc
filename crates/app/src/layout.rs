@@ -9,18 +9,21 @@ use std::sync::Arc;
 use egui::epaint::text::PlacedRow;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Stroke, Vec2, pos2, vec2};
-use goddoc_core::{Align, Document, Font, Format, List, PageSetup, Para, Picture, Script};
+use goddoc_core::{Align, Document, Font, Format, PageSetup, Para, Picture, Script};
 
 /// Space between two pages on screen.
 pub const PAGE_GAP: f32 = 18.0;
 /// Line height, in font sizes.
-const LINE_HEIGHT: f32 = 1.3;
+pub const LINE_HEIGHT: f32 = 1.3;
 /// Width of one indent level, in points.
 const INDENT_STEP: f32 = 24.0;
 /// Raised and lowered text is this much smaller.
 const SCRIPT_SCALE: f32 = 0.62;
 /// Indent of list paragraphs, in points; the marker sits in it.
 const LIST_INDENT: f32 = 22.0;
+/// Space left of a list marker and between a marker and its text, in points.
+const MARKER_LEAD: f32 = 4.0;
+const MARKER_GAP: f32 = 5.0;
 /// Space between a table cell's border and its text, in points.
 const CELL_PAD: f32 = 5.0;
 
@@ -216,7 +219,8 @@ pub fn text_format(format: &Format, zoom: f32, spacing: f32) -> TextFormat {
             .map_or(Color32::TRANSPARENT, |[r, g, b]| Color32::from_rgb(r, g, b)),
         line_height: Some(full * LINE_HEIGHT * spacing),
         italics: format.italic,
-        underline: line(format.underline),
+        // Underlines are drawn apart, by [`underlines`].
+        underline: Stroke::NONE,
         strikethrough: line(format.strike),
         valign,
         ..Default::default()
@@ -258,6 +262,64 @@ pub struct Marker {
     pub pos: Pos2,
     pub text: String,
     pub format: Format,
+    /// Line spacing factor of its paragraph.
+    pub spacing: f32,
+}
+
+/// A stretch of underline, relative to the galley.
+pub struct Underline {
+    pub from: Pos2,
+    pub to: Pos2,
+    pub stroke: Stroke,
+}
+
+/// The underlines of the rows of `galley` that show in `visible`; `formats` has the format
+/// of each of its characters. The text does not draw them itself: it would break them
+/// wherever the font, its weight or its size changes.
+pub fn underlines(galley: &Galley, formats: &[Format], zoom: f32, visible: Rect) -> Vec<Underline> {
+    let mut lines = Vec::new();
+    let mut start = 0;
+    for row in &galley.rows {
+        let first = start;
+        start += row.char_count_including_newline().0;
+        let glyphs = &row.glyphs;
+        let hidden = row.max_y() < visible.top() || row.min_y() > visible.bottom();
+        let Some(formats) = formats.get(first..first + glyphs.len()).filter(|_| !hidden) else {
+            continue;
+        };
+        let mut at = 0;
+        while at < glyphs.len() {
+            if !formats[at].underline {
+                at += 1;
+                continue;
+            }
+            let end = (at..glyphs.len())
+                .find(|index| !formats[*index].underline)
+                .unwrap_or(glyphs.len());
+            // One height and one thickness along the stretch, set by its largest text.
+            let sizes = formats[at..end].iter().map(|format| format.size);
+            let size = sizes.fold(0.0, f32::max) * zoom;
+            let baselines = glyphs[at..end].iter().map(|glyph| glyph.pos.y);
+            let y = row.pos.y + baselines.fold(f32::MIN, f32::max) + (size * 0.1).max(1.5);
+            // A change of colour is the only thing that starts a new line.
+            for colored in formats[at..end].chunk_by(|a, b| a.color == b.color) {
+                let [r, g, b] = colored[0].color;
+                let last = at + colored.len() - 1;
+                // Up to where the next character of the stretch starts: no gap between two.
+                let right = match glyphs.get(last + 1).filter(|_| last + 1 < end) {
+                    Some(next) => next.pos.x,
+                    None => glyphs[last].max_x(),
+                };
+                lines.push(Underline {
+                    from: pos2(row.pos.x + glyphs[at].pos.x, y),
+                    to: pos2(row.pos.x + right, y),
+                    stroke: Stroke::new((size / 14.0).max(1.0), Color32::from_rgb(r, g, b)),
+                });
+                at = last + 1;
+            }
+        }
+    }
+    lines
 }
 
 /// A picture as shown, above the text of paragraph `para`.
@@ -357,16 +419,6 @@ fn level_indent(para: &Para, zoom: f32) -> f32 {
     f32::from(para.indent) * INDENT_STEP * zoom
 }
 
-/// Left inset of a paragraph's text: its indent level, plus room for a list marker.
-fn indent(para: &Para, zoom: f32) -> f32 {
-    let marker = if para.list == List::None {
-        0.0
-    } else {
-        LIST_INDENT * zoom
-    };
-    level_indent(para, zoom) + marker
-}
-
 /// Size on screen of the paragraph's picture, at most `max_width` wide (zero without one).
 fn picture_size(para: &Para, max_width: f32, zoom: f32) -> Vec2 {
     let Some(picture) = para.picture else {
@@ -458,7 +510,54 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         let padding = if para.cell.is_some() { 2.0 * pad } else { 0.0 };
         column_width(para) - padding
     };
-    let wrap_of = |para: &Para| inner_width(para) - indent(para, zoom);
+    let mut starts = Vec::with_capacity(paras.len());
+    let mut start = 0;
+    for text in doc.text().split('\n') {
+        starts.push(start);
+        start += text.chars().count() + 1;
+    }
+    let labels = doc.markers();
+    // Look of a paragraph's marker: that of the start of its text, plain.
+    let marker_format = |index: usize| {
+        let first = formats.get(starts[index]).copied();
+        let empty = starts
+            .get(index + 1)
+            .is_none_or(|next| next - 1 == starts[index]);
+        Format {
+            italic: false,
+            underline: false,
+            strike: false,
+            highlight: None,
+            script: Script::Normal,
+            ..first
+                .filter(|_| !empty)
+                .unwrap_or_else(|| paras[index].kind.format())
+        }
+    };
+    // The number of a heading starts where text does; a list marker sits in from it.
+    let lead = |para: &Para| match para.kind.heading_level() {
+        Some(_) => 0.0,
+        None => MARKER_LEAD * zoom,
+    };
+    // Left inset of each paragraph's text: its indent level, plus room for its marker.
+    let insets: Vec<f32> = (0..paras.len())
+        .map(|index| {
+            let para = &paras[index];
+            let level = level_indent(para, zoom);
+            let Some(label) = &labels[index] else {
+                return level;
+            };
+            let look = text_format(&marker_format(index), zoom, 1.0);
+            let job = LayoutJob::single_section(label.clone(), look);
+            let room = lead(para) + painter.layout_job(job).size().x + MARKER_GAP * zoom;
+            let least = match para.kind.heading_level() {
+                Some(_) => 0.0,
+                None => LIST_INDENT * zoom,
+            };
+            level + room.max(least)
+        })
+        .collect();
+    let wrap_of = |index: usize| inner_width(&paras[index]) - insets[index];
     // Height a paragraph's picture takes, gap included.
     let picture_height = |para: &Para| {
         let size = picture_size(para, inner_width(para), zoom);
@@ -470,14 +569,16 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     };
 
     let mut galleys = Vec::with_capacity(paras.len());
-    let mut starts = Vec::with_capacity(paras.len());
-    let mut start = 0;
-    for (para, text) in paras.iter().zip(doc.text().split('\n')) {
-        let count = text.chars().count();
-        let slice = &formats[start..start + count];
-        galleys.push(para_galley(painter, text, slice, para, zoom, wrap_of(para)));
-        starts.push(start);
-        start += count + 1;
+    for (index, (para, text)) in paras.iter().zip(doc.text().split('\n')).enumerate() {
+        let slice = &formats[starts[index]..starts[index] + text.chars().count()];
+        galleys.push(para_galley(
+            painter,
+            text,
+            slice,
+            para,
+            zoom,
+            wrap_of(index),
+        ));
     }
     let job = Arc::new(document_job(doc, zoom, content.x));
     let mut galley = Galley::concat(job, &galleys, painter.pixels_per_point());
@@ -495,7 +596,6 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     let mut rules = Vec::new();
     // Table the last block is, to grow it row by row.
     let mut open_table = None;
-    let mut number = 0;
     // First galley row of each paragraph.
     let mut first_rows = Vec::with_capacity(paras.len());
     let mut row = 0;
@@ -506,22 +606,14 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     let rows_of = |index: usize| first_rows[index]..first_rows[index] + galleys[index].rows.len();
     let mut mark = |index: usize, pos: Pos2| {
         let para = &paras[index];
-        number = if para.list == List::Number {
-            number + 1
-        } else {
-            0
-        };
-        let text = match para.list {
-            List::None => return,
-            List::Bullet => "•".to_owned(),
-            List::Number => format!("{number}."),
-        };
-        let format = formats
-            .get(starts[index])
-            .filter(|_| !galleys[index].is_empty())
-            .copied()
-            .unwrap_or_else(|| para.kind.format());
-        markers.push(Marker { pos, text, format });
+        if let Some(text) = labels[index].clone() {
+            markers.push(Marker {
+                pos: pos + vec2(lead(para), 0.0),
+                text,
+                format: marker_format(index),
+                spacing: para.spacing.factor(),
+            });
+        }
     };
     // Place paragraph `index`'s picture with its top-left column corner at `origin`.
     let mut show_picture = |index: usize, origin: Pos2| {
@@ -548,7 +640,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             if para.page_break && !placer.at_top() {
                 placer.new_page();
             }
-            let inset = indent(para, zoom);
+            let inset = insets[index];
             let rows = &mut galley.rows[rows_of(index)];
             // A picture stays with the first line under it.
             placer.fit(picture_height(para) + rows[0].size.y);
@@ -559,7 +651,12 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             for row in rows {
                 placer.fit(row.size.y);
                 let origin = pos2(inset, placer.y);
-                placer.y += stack(std::slice::from_mut(row), origin, wrap_of(para), para.align);
+                placer.y += stack(
+                    std::slice::from_mut(row),
+                    origin,
+                    wrap_of(index),
+                    para.align,
+                );
             }
             if para.rule {
                 placer.y += 3.0 * zoom;
@@ -608,11 +705,11 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             let origin = pos2(left + pad, top + pad + *used);
             mark(index, origin + vec2(level_indent(para, zoom), 0.0));
             let rows = rows_of(index);
-            let text_origin = origin + vec2(indent(para, zoom), 0.0);
+            let text_origin = origin + vec2(insets[index], 0.0);
             *used += stack(
                 &mut galley.rows[rows.clone()],
                 text_origin,
-                wrap_of(para),
+                wrap_of(index),
                 para.align,
             );
             let rect = Rect::from_min_size(pos2(left, top), vec2(width, row_height));

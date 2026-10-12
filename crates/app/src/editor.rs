@@ -13,7 +13,7 @@ use egui::{
     Color32, Context, CornerRadius, CursorIcon, FontId, Frame, Id, Margin, Rect, ScrollArea, Sense,
     Shadow, Stroke, StrokeKind, TextBuffer, TextEdit, TextureId, Ui, UiBuilder, Vec2, pos2, vec2,
 };
-use goddoc_core::{Align, Document, Format, Image, List, Picture};
+use goddoc_core::{Align, Document, Format, Image, Kind, List, Picture};
 
 use crate::layout::{self, PageLayout, PictureBox};
 use crate::widgets::icon;
@@ -27,6 +27,10 @@ const GRIP_ZONE: f32 = 44.0;
 /// Narrowest a picture can be made, in points.
 const MIN_PICTURE: f32 = 16.0;
 const HANDLE: f32 = 9.0;
+/// Seconds the caret shows, then hides: the blink of Windows.
+const CARET_BLINK: f64 = 0.53;
+/// Height of the caret, in font sizes.
+const CARET_HEIGHT: f32 = 1.18;
 
 /// Gives the texture of an image, decoding it on first use.
 pub type Textures<'a> = &'a mut dyn FnMut(&Context, &Image) -> Option<TextureId>;
@@ -67,6 +71,8 @@ pub struct View {
     pub found: Option<Range<usize>>,
     /// Where the right-click menu is open.
     menu_at: Option<egui::Pos2>,
+    /// Where the caret is, and since when: its blink starts over when it moves.
+    caret: (usize, f64),
 }
 
 pub struct Output {
@@ -149,8 +155,8 @@ fn paint_pages(
         painter.hline(left.x..=left.x + length, left.y, line);
     }
     for marker in &pages.markers {
-        let look = layout::text_format(&marker.format, zoom, 1.0);
-        let pos = marker.pos + origin + vec2(4.0 * zoom, 0.0);
+        let look = layout::text_format(&marker.format, zoom, marker.spacing);
+        let pos = marker.pos + origin;
         if ui.is_rect_visible(Rect::from_min_size(pos, Vec2::splat(look.font_id.size))) {
             let job = egui::text::LayoutJob::single_section(marker.text.clone(), look);
             painter.galley(pos, painter.layout_job(job), Color32::BLACK);
@@ -518,20 +524,95 @@ fn apply(ui: &Ui, id: Id, doc: &mut Document, change: Change, view: &mut View) -
     Some(before)
 }
 
+/// The caret at character `index`: a thin line from `top` to `bottom` at `x`, blinking as
+/// carets do in Windows.
+fn paint_caret(ui: &Ui, x: f32, top: f32, bottom: f32, index: usize, view: &mut View) {
+    let now = ui.input(|input| input.time);
+    if view.caret.0 != index {
+        view.caret = (index, now);
+    }
+    let phase = (now - view.caret.1) % (2.0 * CARET_BLINK);
+    if phase < CARET_BLINK {
+        let line = Stroke::new(1.0, Color32::BLACK);
+        ui.painter().vline(x, top..=bottom, line);
+    }
+    let wait = CARET_BLINK - phase % CARET_BLINK;
+    ui.ctx()
+        .request_repaint_after(std::time::Duration::from_secs_f64(wait));
+}
+
+/// Underlines of the text of `galley`, shown at `at`.
+fn paint_underlines(ui: &Ui, galley: &egui::Galley, at: egui::Pos2, doc: &Document, zoom: f32) {
+    let visible = ui.clip_rect().translate(-at.to_vec2());
+    for line in layout::underlines(galley, doc.formats(), zoom, visible) {
+        let (from, to) = (line.from + at.to_vec2(), line.to + at.to_vec2());
+        ui.painter().hline(from.x..=to.x, from.y, line.stroke);
+    }
+}
+
+/// Byte at which character `index` of `text` starts.
+fn byte_of(text: &str, index: usize) -> usize {
+    let mut bytes = text.char_indices().map(|(byte, _)| byte);
+    bytes.nth(index).unwrap_or(text.len())
+}
+
 /// What typing made of the document, or `None` when the edit is not allowed (it would break a
-/// table apart). The second value is where the caret must go when the edit was reinterpreted.
-fn edited(doc: &Document, buffer: &str, typing: Format) -> Option<(Document, Option<usize>)> {
-    let (range, inserted) = doc.diff(buffer);
+/// table apart). `caret` is where the caret was, when nothing was selected. The second value
+/// is where the caret must go when the edit was reinterpreted.
+fn edited(
+    doc: &Document,
+    buffer: &str,
+    typing: Format,
+    caret: Option<usize>,
+) -> Option<(Document, Option<usize>)> {
+    let (mut range, inserted) = doc.diff(buffer);
+    // Typed among characters equal to it, text shows further than it was put: the caret
+    // tells where it went (Enter between two line breaks, a letter doubled).
+    if let Some(caret) = caret.filter(|caret| range.is_empty() && *caret < range.start) {
+        let (before, after) = doc.text().split_at(byte_of(doc.text(), caret));
+        if [before, inserted.as_str(), after].concat() == buffer {
+            range = caret..caret;
+        }
+    }
     let para = doc.para_at(range.start);
+    let chars = doc.para_chars(para);
+    let here = doc.paras()[para];
     let mut edited = doc.clone();
-    // Enter on an empty list item ends the list instead of adding an item.
-    let ends_list = range.is_empty()
-        && inserted == "\n"
-        && doc.paras()[para].list != List::None
-        && doc.para_chars(para).is_empty();
-    if ends_list {
-        edited.set_list(para..para + 1, List::None);
+    // Enter on an empty list item leaves its level, then the list, instead of adding an item.
+    if range.is_empty() && inserted == "\n" && here.list != List::None && chars.is_empty() {
+        if here.indent == 0 || !edited.nest(para..para + 1, false) {
+            edited.set_list(para..para + 1, List::None);
+        }
         return Some((edited, Some(range.start)));
+    }
+    // Backspace at the start of a list item takes it out of the list and keeps its text.
+    if let Some(caret) = caret.filter(|caret| *caret > 0 && inserted.is_empty() && range.len() == 1)
+    {
+        let item = doc.para_at(caret);
+        let listed = doc.paras()[item].list != List::None && doc.para_chars(item).start == caret;
+        // Equal neighbours hide which character went: make sure it is the break before.
+        let joined = doc.text().chars().enumerate();
+        let joined: String = joined
+            .filter(|(at, _)| *at != caret - 1)
+            .map(|(_, ch)| ch)
+            .collect();
+        if listed && joined == buffer {
+            edited.set_list(item..item + 1, List::None);
+            return Some((edited, Some(caret)));
+        }
+    }
+    // "-", "*" or "1." then a space at the start of a paragraph starts a list.
+    if range.is_empty() && inserted == " " && here.list == List::None {
+        let typed = doc.text().chars().skip(chars.start);
+        let typed: String = typed.take(range.start - chars.start).collect();
+        // A heading can be numbered, not bulleted.
+        let list = List::of_shortcut(&typed)
+            .filter(|list| here.kind == Kind::Normal || *list == List::Number);
+        if let Some(list) = list {
+            edited.replace(chars.start..range.start, "", typing);
+            edited.set_list(para..para + 1, list);
+            return Some((edited, Some(chars.start)));
+        }
     }
     edited.replace(range, &inserted, typing);
     edited.tables_intact(doc).then_some((edited, None))
@@ -605,11 +686,17 @@ pub fn show(
         let mut child = ui.new_child(UiBuilder::new().max_rect(text_area));
         // The paper is white in both themes.
         let visuals = child.visuals_mut();
-        visuals.text_cursor.stroke.color = Color32::BLACK;
+        // The caret is drawn here, by `paint_caret`.
+        visuals.text_cursor.stroke = Stroke::NONE;
         visuals.selection.bg_fill = Color32::from_gray(0xC8);
         visuals.selection.stroke.color = Color32::BLACK;
 
         let mut buffer = doc.text().to_owned();
+        // Where the caret is before this frame's typing, when nothing is selected.
+        let caret = TextEdit::load_state(ui.ctx(), id)
+            .and_then(|state| state.cursor.char_range())
+            .filter(|range| range.primary == range.secondary)
+            .map(|range| range.primary.index.0);
         let output = {
             let doc = &*doc;
             let mut layouter = |ui: &Ui, text: &dyn TextBuffer, _wrap: f32| {
@@ -646,7 +733,7 @@ pub fn show(
             output.response.response.request_focus();
         }
         if buffer != doc.text() {
-            if let Some((edited, caret)) = edited(doc, &buffer, typing) {
+            if let Some((edited, caret)) = edited(doc, &buffer, typing, caret) {
                 out.before = Some(std::mem::replace(doc, edited));
                 view.selected_picture = None;
                 view.found = None;
@@ -661,6 +748,27 @@ pub fn show(
             out.before = Some(before);
             out.structural = true;
             ui.ctx().request_repaint();
+        }
+        // The galley is that of the text typed: the formats are only its own once the edit is in.
+        if output.galley.text() == doc.text() {
+            paint_underlines(ui, &output.galley, output.galley_pos, doc, zoom);
+        }
+        if let Some(range) = output
+            .cursor_range
+            .filter(|_| output.response.response.has_focus())
+        {
+            let index = range.primary.index.0;
+            let line = output.galley.pos_from_cursor(range.primary);
+            let line = line.translate(output.galley_pos.to_vec2());
+            // As tall as the text typed there, not as the line, which line spacing makes
+            // taller. Text sits at the top of its share of the line, shares at its bottom.
+            let size = typing.size * zoom;
+            let spacing = doc.paras()[doc.para_at(index)].spacing.factor();
+            let top = line
+                .top()
+                .max(line.bottom() - size * layout::LINE_HEIGHT * spacing);
+            let bottom = (top + size * CARET_HEIGHT).min(line.bottom());
+            paint_caret(ui, line.center().x, top, bottom, index, view);
         }
         out.selection = output.cursor_range.map(|range| {
             let (a, b) = (range.primary.index.0, range.secondary.index.0);
@@ -750,6 +858,29 @@ mod tests {
             self.frame(vec![Event::Text(text.to_owned())]);
             self.frame(Vec::new());
         }
+
+        /// Give the page the keyboard, the caret at character `caret`.
+        fn focus(&mut self, caret: usize) {
+            let id = Id::new("editor");
+            self.ctx.memory_mut(|memory| memory.request_focus(id));
+            set_selection(&self.ctx, id, Some(caret), caret);
+            self.frame(Vec::new());
+        }
+
+        fn press(&mut self, key: egui::Key) {
+            self.frame(vec![Event::Key {
+                key,
+                physical_key: None,
+                pressed: true,
+                repeat: false,
+                modifiers: Modifiers::NONE,
+            }]);
+            self.frame(Vec::new());
+        }
+
+        fn lists(&self) -> Vec<List> {
+            self.doc.paras().iter().map(|para| para.list).collect()
+        }
     }
 
     #[test]
@@ -810,5 +941,82 @@ mod tests {
         harness.click_cell(2);
         harness.type_text("c");
         assert_eq!(harness.doc.text(), "intro\nax\nb\nc\nd\n");
+    }
+
+    #[test]
+    fn a_dash_and_a_space_start_a_list_that_goes_on() {
+        let mut harness = Harness::new(Document::default());
+        harness.focus(0);
+        harness.type_text("-");
+        harness.type_text(" ");
+        assert_eq!(
+            (harness.doc.text(), harness.lists()),
+            ("", vec![List::Dash])
+        );
+        harness.type_text("one");
+        harness.press(egui::Key::Enter);
+        harness.type_text("two");
+        assert_eq!(harness.doc.text(), "one\ntwo");
+        assert_eq!(harness.lists(), [List::Dash, List::Dash]);
+
+        // Enter on an empty item ends the list there.
+        harness.focus(3);
+        harness.press(egui::Key::Enter);
+        assert_eq!(harness.lists(), [List::Dash, List::Dash, List::Dash]);
+        harness.press(egui::Key::Enter);
+        assert_eq!(harness.doc.text(), "one\n\ntwo");
+        assert_eq!(harness.lists(), [List::Dash, List::None, List::Dash]);
+
+        // Backspace at the start of an item takes it out of the list and keeps its text.
+        harness.focus(5);
+        harness.press(egui::Key::Backspace);
+        assert_eq!(harness.doc.text(), "one\n\ntwo");
+        assert_eq!(harness.lists(), [List::Dash, List::None, List::None]);
+        harness.press(egui::Key::Backspace);
+        assert_eq!(harness.doc.text(), "one\ntwo");
+    }
+
+    #[test]
+    fn enter_after_a_numbered_heading_starts_plain_text() {
+        let mut doc = Document::default();
+        doc.replace(0..0, "Part", Format::default());
+        doc.set_kind(0..1, Kind::Heading1);
+        doc.set_list(0..1, List::Number);
+        let mut harness = Harness::new(doc);
+        harness.focus(4);
+        harness.press(egui::Key::Enter);
+        harness.type_text("text");
+        assert_eq!(harness.doc.text(), "Part\ntext");
+        let second = harness.doc.paras()[1];
+        assert_eq!((second.kind, second.list), (Kind::Normal, List::None));
+        assert_eq!(harness.doc.markers(), [Some("1.".to_owned()), None]);
+    }
+
+    #[test]
+    fn an_underline_runs_unbroken_under_bold_and_larger_text() {
+        let mut doc = Document::default();
+        doc.replace(0..0, "plain under bold big end", Format::default());
+        doc.restyle(6..20, |format| format.underline = true);
+        doc.restyle(12..16, |format| format.bold = true);
+        doc.restyle(17..20, |format| format.size = 24.0);
+        let harness = Harness::new(doc);
+        let mut lines = Vec::new();
+        let _ = harness.ctx.run_ui(RawInput::default(), |ui| {
+            let pages = layout::layout(ui.painter(), &harness.doc, 1.0);
+            let formats = harness.doc.formats();
+            lines = layout::underlines(&pages.galley, formats, 1.0, Rect::EVERYTHING);
+        });
+        assert_eq!(lines.len(), 1, "one line under the whole stretch");
+        assert!(lines[0].to.x - lines[0].from.x > 60.0);
+        // Another colour draws its own stretch, at the same height.
+        let mut doc = harness.doc.clone();
+        doc.restyle(12..16, |format| format.color = [0xD9, 0x2D, 0x20]);
+        let _ = harness.ctx.run_ui(RawInput::default(), |ui| {
+            let pages = layout::layout(ui.painter(), &doc, 1.0);
+            lines = layout::underlines(&pages.galley, doc.formats(), 1.0, Rect::EVERYTHING);
+        });
+        assert_eq!(lines.len(), 3);
+        assert!(lines.iter().all(|line| line.from.y == lines[0].from.y));
+        assert_eq!(lines[0].to.x, lines[1].from.x);
     }
 }

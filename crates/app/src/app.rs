@@ -109,6 +109,8 @@ enum Edit {
     Spacing(Spacing),
     /// Indent levels to add (negative: remove).
     Indent(i8),
+    /// Move headings and list items one level down (true) or up their hierarchy.
+    Nest(bool),
     /// Show or hide the line under the paragraph.
     Rule,
     ClearFormat,
@@ -314,6 +316,14 @@ impl DocTab {
                 return self.edit_paras(|para| {
                     para.indent = para.indent.saturating_add_signed(by).min(MAX_INDENT);
                 });
+            }
+            Edit::Nest(deeper) => {
+                let before = self.doc.clone();
+                if self.doc.nest(self.doc.paras_in(chars), deeper) {
+                    self.checkpoint(before);
+                    self.touched();
+                }
+                return;
             }
             Edit::Rule => {
                 let on = !self.para().rule;
@@ -925,11 +935,22 @@ impl GodApp {
         {
             clicked.push(Cmd::DeleteImage);
         }
-        if tab.para().cell.is_some()
-            && ctx.memory(|memory| memory.has_focus(tab.editor_id()))
-            && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab))
-        {
-            clicked.push(Cmd::NextCell);
+        let para = tab.para();
+        let focused = ctx.memory(|memory| memory.has_focus(tab.editor_id()));
+        // In a heading or a list, Tab goes a level down and Shift+Tab a level up.
+        let nests = para.kind.heading_level().is_some() || para.list != List::None;
+        if para.cell.is_some() {
+            if focused && ctx.input_mut(|input| input.consume_key(Modifiers::NONE, Key::Tab)) {
+                clicked.push(Cmd::NextCell);
+            }
+        } else if focused && nests {
+            // Shift first: a bare Tab would answer for it too.
+            let key = |modifiers| ctx.input_mut(|input| input.consume_key(modifiers, Key::Tab));
+            if key(Modifiers::SHIFT) {
+                clicked.push(Cmd::Edit(Edit::Nest(false)));
+            } else if key(Modifiers::NONE) {
+                clicked.push(Cmd::Edit(Edit::Nest(true)));
+            }
         }
         let dropped = ctx.input(|input| input.raw.dropped_files.clone());
         for path in dropped.into_iter().filter_map(|file| file.path) {
@@ -1174,6 +1195,7 @@ impl GodApp {
             let lists = [
                 (icon::LIST_BULLETS, "Bullet list", List::Bullet),
                 (icon::LIST_NUMBERS, "Numbered list", List::Number),
+                (icon::LIST_DASHES, "Dash list", List::Dash),
             ];
             for (glyph, tip, list) in lists {
                 if widgets::toggle_button(ui, glyph, tip, para.list == list).clicked() {
@@ -1655,7 +1677,9 @@ impl GodApp {
         ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
             let mut start = 0;
             let mut any = false;
-            for (text, para) in doc.text().split('\n').zip(doc.paras()) {
+            let markers = doc.markers();
+            let paras = doc.paras().iter().zip(&markers);
+            for (text, (para, marker)) in doc.text().split('\n').zip(paras) {
                 let here = start;
                 start += text.chars().count() + 1;
                 let level = match para.kind {
@@ -1670,6 +1694,11 @@ impl GodApp {
                 any = true;
                 ui.horizontal(|ui| {
                     ui.add_space(level * 14.0);
+                    // A numbered heading shows with its number.
+                    let text = match marker {
+                        Some(number) => format!("{number} {text}"),
+                        None => text.to_owned(),
+                    };
                     let mut label = RichText::new(text).size(14.0 - level);
                     if level == 0.0 {
                         label = label.strong();

@@ -5,6 +5,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
+use std::rc::Rc;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
@@ -94,8 +95,13 @@ fn drawing_xml(picture: Picture, rel: &str, number: usize) -> String {
         r#"<w:r><w:drawing><wp:inline distT="0" distB="0" distL="0" distR="0"><wp:extent cx="{width}" cy="{height}"/><wp:docPr id="{number}" name="Picture {number}"/><a:graphic xmlns:a="{GRAPHIC_NS}"><a:graphicData uri="{PICTURE_NS}"><pic:pic xmlns:pic="{PICTURE_NS}"><pic:nvPicPr><pic:cNvPr id="{number}" name="Picture {number}"/><pic:cNvPicPr/></pic:nvPicPr><pic:blipFill><a:blip r:embed="{rel}"/><a:stretch><a:fillRect/></a:stretch></pic:blipFill><pic:spPr><a:xfrm><a:off x="0" y="0"/><a:ext cx="{width}" cy="{height}"/></a:xfrm><a:prstGeom prst="rect"><a:avLst/></a:prstGeom></pic:spPr></pic:pic></a:graphicData></a:graphic></wp:inline></w:drawing></w:r>"#
     )
 }
-/// Numbering id of bullet lists; numbered lists take the ids after it, one per list.
+/// Numbering ids of bullet lists, dash lists and numbered headings; numbered lists take the
+/// ids after them, one per list.
 const BULLET_NUM_ID: u32 = 1;
+const DASH_NUM_ID: u32 = 2;
+const HEADING_NUM_ID: u32 = 3;
+/// Levels a list is written with.
+const LIST_LEVELS: usize = MAX_INDENT as usize + 1;
 
 impl Kind {
     /// Style id in .docx files.
@@ -194,23 +200,58 @@ fn styles_xml() -> String {
     xml
 }
 
-/// One bullet definition, one numbered definition, and a numbering instance per numbered
-/// list so that each restarts at 1.
+/// The levels of a list definition: `level` gives the number format and the text of each.
+fn list_levels(
+    count: usize,
+    heading: bool,
+    level: impl Fn(usize) -> (&'static str, String),
+) -> String {
+    (0..count)
+        .map(|index| {
+            let (format, text) = level(index);
+            // The number of a heading stands where its text starts, a space after it.
+            let (suffix, left, hanging) = if heading {
+                (r#"<w:suff w:val="space"/>"#, 0, 0)
+            } else {
+                ("", (index as u32 + 1) * INDENT_STEP, INDENT_STEP / 2)
+            };
+            format!(
+                r#"<w:lvl w:ilvl="{index}"><w:start w:val="1"/><w:numFmt w:val="{format}"/>{suffix}<w:lvlText w:val="{text}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="{left}" w:hanging="{hanging}"/></w:pPr></w:lvl>"#
+            )
+        })
+        .collect()
+}
+
+/// Bullets, numbers, dashes and heading numbers, each with its levels, and a numbering
+/// instance per numbered list so that each restarts at 1.
 fn numbering_xml(numbered_lists: u32) -> String {
-    let level = |format: &str, text: &str| {
-        format!(
-            r#"<w:lvl w:ilvl="0"><w:start w:val="1"/><w:numFmt w:val="{format}"/><w:lvlText w:val="{text}"/><w:lvlJc w:val="left"/><w:pPr><w:ind w:left="720" w:hanging="360"/></w:pPr></w:lvl>"#
-        )
-    };
-    let mut xml = format!(
-        r#"{XML_HEADER}<w:numbering xmlns:w="{WORD_NS}"><w:abstractNum w:abstractNumId="0">{}</w:abstractNum><w:abstractNum w:abstractNumId="1">{}</w:abstractNum><w:num w:numId="{BULLET_NUM_ID}"><w:abstractNumId w:val="0"/></w:num>"#,
-        level("bullet", "•"),
-        level("decimal", "%1.")
-    );
+    let bullets = list_levels(LIST_LEVELS, false, |level| {
+        ("bullet", ["•", "◦", "▪"][level % 3].to_owned())
+    });
+    let numbers = list_levels(LIST_LEVELS, false, |level| {
+        let format = ["decimal", "lowerLetter", "lowerRoman"][level % 3];
+        (format, format!("%{}.", level + 1))
+    });
+    let dashes = list_levels(LIST_LEVELS, false, |_| ("bullet", "–".to_owned()));
+    let headings = list_levels(Kind::HEADINGS.len(), true, |level| {
+        let text = (1..=level + 1).map(|number| format!("%{number}."));
+        ("decimal", text.collect())
+    });
+    let mut xml = format!(r#"{XML_HEADER}<w:numbering xmlns:w="{WORD_NS}">"#);
+    for (id, levels) in [bullets, numbers, dashes, headings].iter().enumerate() {
+        xml.push_str(&format!(
+            r#"<w:abstractNum w:abstractNumId="{id}"><w:multiLevelType w:val="multilevel"/>{levels}</w:abstractNum>"#
+        ));
+    }
+    for (num, definition) in [(BULLET_NUM_ID, 0), (DASH_NUM_ID, 2), (HEADING_NUM_ID, 3)] {
+        xml.push_str(&format!(
+            r#"<w:num w:numId="{num}"><w:abstractNumId w:val="{definition}"/></w:num>"#
+        ));
+    }
     for list in 1..=numbered_lists {
         xml.push_str(&format!(
             r#"<w:num w:numId="{}"><w:abstractNumId w:val="1"/><w:lvlOverride w:ilvl="0"><w:startOverride w:val="1"/></w:lvlOverride></w:num>"#,
-            BULLET_NUM_ID + list
+            HEADING_NUM_ID + list
         ));
     }
     xml.push_str("</w:numbering>");
@@ -228,6 +269,8 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
     // Ids of the images shown, in order of first use: the n-th is `image_rel(n)`.
     let mut used_images: Vec<u32> = Vec::new();
     let mut numbered_lists = 0;
+    // The numbered list being written goes on: nothing but list items since it started.
+    let mut list_open = false;
     let mut start = 0;
     let mut previous: Option<Para> = None;
     for para in paras {
@@ -241,16 +284,25 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
             para.cell,
             doc,
         );
-        let continues =
-            previous.is_some_and(|before| before.list == List::Number && before.cell == para.cell);
-        let num_id = match para.list {
-            List::None => None,
-            List::Bullet => Some(BULLET_NUM_ID),
-            List::Number => {
-                if !continues {
+        let heading = para
+            .kind
+            .heading_level()
+            .filter(|_| para.list == List::Number);
+        let same_cell = previous.is_none_or(|before| before.cell == para.cell);
+        list_open &= same_cell && para.list != List::None && heading.is_none();
+        let level = u32::from(para.indent);
+        // (numbering id, level) of the paragraph.
+        let num = match (para.list, heading) {
+            (List::None, _) => None,
+            (_, Some(level)) => Some((HEADING_NUM_ID, level as u32)),
+            (List::Bullet, _) => Some((BULLET_NUM_ID, level)),
+            (List::Dash, _) => Some((DASH_NUM_ID, level)),
+            (List::Number, _) => {
+                if !list_open {
                     numbered_lists += 1;
+                    list_open = true;
                 }
-                Some(BULLET_NUM_ID + numbered_lists)
+                Some((HEADING_NUM_ID + numbered_lists, level))
             }
         };
         let drawing = para.picture.map(|picture| {
@@ -266,7 +318,7 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
         paragraph_xml(
             &mut xml,
             *para,
-            num_id,
+            num,
             &chars[start..end],
             &formats[start..end],
             drawing,
@@ -343,14 +395,14 @@ fn table_tags(xml: &mut String, from: Option<Cell>, to: Option<Cell>, doc: &Docu
 fn paragraph_xml(
     xml: &mut String,
     para: Para,
-    num_id: Option<u32>,
+    num: Option<(u32, u32)>,
     chars: &[char],
     formats: &[Format],
     drawing: Option<String>,
 ) {
     if let Some(drawing) = drawing {
         // The picture gets a paragraph of its own; its caption, if any, follows.
-        let props = para_props(para, num_id);
+        let props = para_props(para, num);
         xml.push_str(&format!("<w:p>{props}{drawing}</w:p>"));
         if chars.is_empty() {
             return;
@@ -361,7 +413,7 @@ fn paragraph_xml(
         ..para
     };
     xml.push_str("<w:p>");
-    xml.push_str(&para_props(para, num_id));
+    xml.push_str(&para_props(para, num));
     let mut start = 0;
     for run in formats.chunk_by(|a, b| a == b) {
         let text = &chars[start..start + run.len()];
@@ -384,8 +436,8 @@ fn paragraph_xml(
     xml.push_str("</w:p>");
 }
 
-/// `w:pPr` of a paragraph.
-fn para_props(para: Para, num_id: Option<u32>) -> String {
+/// `w:pPr` of a paragraph; `num` is its (numbering id, level) in a list.
+fn para_props(para: Para, num: Option<(u32, u32)>) -> String {
     let mut xml = String::from("<w:pPr>");
     if para.kind != Kind::Normal {
         xml.push_str(&format!(r#"<w:pStyle w:val="{}"/>"#, para.kind.style_id()));
@@ -393,9 +445,9 @@ fn para_props(para: Para, num_id: Option<u32>) -> String {
     if para.page_break {
         xml.push_str("<w:pageBreakBefore/>");
     }
-    if let Some(num_id) = num_id {
+    if let Some((id, level)) = num {
         xml.push_str(&format!(
-            r#"<w:numPr><w:ilvl w:val="0"/><w:numId w:val="{num_id}"/></w:numPr>"#
+            r#"<w:numPr><w:ilvl w:val="{level}"/><w:numId w:val="{id}"/></w:numPr>"#
         ));
     }
     if para.rule {
@@ -410,7 +462,8 @@ fn para_props(para: Para, num_id: Option<u32>) -> String {
             r#"<w:spacing w:line="{line}" w:lineRule="auto"/>"#
         ));
     }
-    if para.indent > 0 {
+    // A list item is indented by its level in the list.
+    if para.indent > 0 && num.is_none() {
         let left = u32::from(para.indent) * INDENT_STEP;
         xml.push_str(&format!(r#"<w:ind w:left="{left}"/>"#));
     }
@@ -499,6 +552,10 @@ pub fn read(bytes: &[u8]) -> Result<Document> {
     let lists = part("word/numbering.xml")
         .map(|xml| numbering(&xml))
         .unwrap_or_default();
+    // A file without styles: its text looks as its kind does here.
+    let styles = part("word/styles.xml")
+        .map(|xml| read_styles(&xml))
+        .unwrap_or_default();
     let page_numbers = document.contains("<w:footerReference")
         && names
             .iter()
@@ -522,7 +579,7 @@ pub fn read(bytes: &[u8]) -> Result<Document> {
             );
         }
     }
-    let mut doc = parse(&document, lists, media)?;
+    let mut doc = parse(&document, lists, styles, media)?;
     doc.page_numbers = page_numbers;
     Ok(doc)
 }
@@ -544,14 +601,18 @@ fn relationships(xml: &str) -> Vec<(String, String)> {
     found
 }
 
-/// Kind of list of each numbering id in `word/numbering.xml`.
-fn numbering(xml: &str) -> HashMap<String, List> {
+/// Kind of list of each level of the numbering ids in `word/numbering.xml`.
+type Lists = HashMap<String, Vec<List>>;
+
+fn numbering(xml: &str) -> Lists {
     let mut reader = Reader::from_str(xml);
-    // Abstract definition id -> its first level is a bullet.
-    let mut bullets: HashMap<String, bool> = HashMap::new();
+    // Abstract definition id -> the list each of its levels makes.
+    let mut levels: Lists = HashMap::new();
     let mut nums: Vec<(String, String)> = Vec::new();
     let mut definition = String::new();
     let mut num = String::new();
+    // Inside a `w:num`, whose levels only adjust those of its definition.
+    let mut in_num = false;
     while let Ok(event) = reader.read_event() {
         let tag = match &event {
             Event::Start(tag) | Event::Empty(tag) => tag,
@@ -559,27 +620,175 @@ fn numbering(xml: &str) -> HashMap<String, List> {
             _ => continue,
         };
         let value = |name: &[u8]| attr(tag, name).map(Cow::into_owned).unwrap_or_default();
-        match tag.name().as_ref() {
-            b"w:abstractNum" => definition = value(b"w:abstractNumId"),
-            b"w:numFmt" => {
-                let bullet = value(b"w:val") == "bullet";
-                bullets.entry(definition.clone()).or_insert(bullet);
+        let level = levels
+            .get_mut(&definition)
+            .and_then(|levels| levels.last_mut())
+            .filter(|_| !in_num);
+        match (tag.name().as_ref(), level) {
+            (b"w:abstractNum", _) => {
+                definition = value(b"w:abstractNumId");
+                in_num = false;
             }
-            b"w:num" => num = value(b"w:numId"),
-            b"w:abstractNumId" => nums.push((num.clone(), value(b"w:val"))),
+            (b"w:num", _) => {
+                num = value(b"w:numId");
+                in_num = true;
+            }
+            (b"w:abstractNumId", _) => nums.push((num.clone(), value(b"w:val"))),
+            (b"w:lvl", _) if !in_num => levels
+                .entry(definition.clone())
+                .or_default()
+                .push(List::Number),
+            (b"w:numFmt", Some(level)) => {
+                *level = match value(b"w:val").as_str() {
+                    "bullet" => List::Bullet,
+                    "none" => List::None,
+                    _ => List::Number,
+                };
+            }
+            // A bullet drawn as a dash is a dash list.
+            (b"w:lvlText", Some(level)) if *level == List::Bullet => {
+                if matches!(value(b"w:val").trim(), "-" | "–" | "—" | "‒" | "−") {
+                    *level = List::Dash;
+                }
+            }
             _ => {}
         }
     }
     nums.into_iter()
         .map(|(num, definition)| {
-            let list = if bullets.get(&definition).copied().unwrap_or(true) {
-                List::Bullet
-            } else {
-                List::Number
-            };
-            (num, list)
+            let levels = levels.get(&definition).cloned().unwrap_or_default();
+            (num, levels)
         })
         .collect()
+}
+
+/// A style of `word/styles.xml`, as far as it is followed.
+#[derive(Default)]
+struct Style {
+    name: String,
+    based_on: Option<String>,
+    /// What its `w:rPr` holds.
+    run: Vec<BytesStart<'static>>,
+    /// What it says of its paragraphs: numbering, alignment, indent, line spacing.
+    para: Vec<BytesStart<'static>>,
+}
+
+#[derive(Default)]
+struct Styles {
+    by_id: HashMap<String, Style>,
+    /// What the `w:rPr` of the document defaults holds.
+    defaults: Vec<BytesStart<'static>>,
+    /// Style of the paragraphs that name none.
+    default_para: Option<String>,
+}
+
+impl Styles {
+    /// The style `id` and those it is based on, the most basic first.
+    fn chain(&self, id: &str) -> Vec<&Style> {
+        let mut chain = Vec::new();
+        let mut next = self.by_id.get(id);
+        // Styles based on each other in a circle would never end.
+        while let Some(style) = next.filter(|_| chain.len() < 16) {
+            chain.push(style);
+            next = style.based_on.as_deref().and_then(|id| self.by_id.get(id));
+        }
+        chain.reverse();
+        chain
+    }
+
+    /// Paragraph kind of the style `id`: its own, or that of a style it is based on.
+    fn kind(&self, id: &str) -> Kind {
+        let chain = self.chain(id);
+        let named = chain.iter().rev().map(|style| Kind::of_style(&style.name));
+        std::iter::once(Kind::of_style(id))
+            .chain(named)
+            .find(|kind| *kind != Kind::Normal)
+            .unwrap_or_default()
+    }
+
+    /// Look of the text of a paragraph of style `id` (`None`: the default style) and `kind`.
+    fn format(&self, id: Option<&str>, kind: Kind) -> Format {
+        let chain = id
+            .or(self.default_para.as_deref())
+            .map(|id| self.chain(id))
+            .unwrap_or_default();
+        // A heading style the file does not describe looks as headings do here.
+        if chain.is_empty() && kind != Kind::Normal {
+            return kind.format();
+        }
+        let mut format = Kind::Normal.format();
+        let own = chain.iter().flat_map(|style| &style.run);
+        self.defaults
+            .iter()
+            .chain(own)
+            .for_each(|tag| run_prop(&mut format, tag));
+        format
+    }
+
+    /// Give `format` the look of the character style `id`.
+    fn restyle(&self, id: &str, format: &mut Format) {
+        let chain = self.chain(id);
+        let tags = chain.iter().flat_map(|style| &style.run);
+        tags.for_each(|tag| run_prop(format, tag));
+    }
+}
+
+/// The styles of `word/styles.xml`.
+fn read_styles(xml: &str) -> Styles {
+    let mut reader = Reader::from_str(xml);
+    let mut styles = Styles::default();
+    // Id of the style being read.
+    let mut current: Option<String> = None;
+    let mut in_defaults = false;
+    let mut in_run = false;
+    let mut in_para = false;
+    loop {
+        let event = match reader.read_event() {
+            Ok(Event::Eof) | Err(_) => break,
+            Ok(event) => event,
+        };
+        let (tag, empty) = match &event {
+            Event::Start(tag) => (tag, false),
+            Event::Empty(tag) => (tag, true),
+            Event::End(tag) => {
+                match tag.name().as_ref() {
+                    b"w:style" => current = None,
+                    b"w:docDefaults" => in_defaults = false,
+                    b"w:rPr" => in_run = false,
+                    b"w:pPr" => in_para = false,
+                    _ => {}
+                }
+                continue;
+            }
+            _ => continue,
+        };
+        let value = |name: &[u8]| attr(tag, name).map(Cow::into_owned).unwrap_or_default();
+        let style = current.as_ref().and_then(|id| styles.by_id.get_mut(id));
+        match (tag.name().as_ref(), style) {
+            (b"w:docDefaults", _) => in_defaults = true,
+            (b"w:style", _) => {
+                let id = value(b"w:styleId");
+                if value(b"w:type") == "paragraph" && is_set(tag, b"w:default") {
+                    styles.default_para = Some(id.clone());
+                }
+                styles.by_id.insert(id.clone(), Style::default());
+                current = (!empty).then_some(id);
+            }
+            (b"w:rPr", _) => in_run = !empty,
+            (b"w:pPr", _) => in_para = !empty,
+            (_, Some(style)) if in_run => style.run.push(tag.to_owned()),
+            (_, None) if in_run && in_defaults => styles.defaults.push(tag.to_owned()),
+            (b"w:name", Some(style)) => style.name = value(b"w:val"),
+            (b"w:basedOn", Some(style)) => style.based_on = Some(value(b"w:val")),
+            (b"w:ilvl" | b"w:numId" | b"w:jc" | b"w:ind" | b"w:spacing", Some(style))
+                if in_para =>
+            {
+                style.para.push(tag.to_owned());
+            }
+            _ => {}
+        }
+    }
+    styles
 }
 
 #[derive(Default)]
@@ -587,7 +796,12 @@ struct Parser {
     text: String,
     formats: Vec<Format>,
     paras: Vec<Para>,
-    lists: HashMap<String, List>,
+    lists: Lists,
+    styles: Rc<Styles>,
+    /// Look of the text of the current paragraph, from its style.
+    base: Format,
+    /// Level in its list of the paragraph being read.
+    level: usize,
     /// Format of the run being read.
     run: Format,
     in_run: bool,
@@ -615,12 +829,14 @@ struct Parser {
 
 fn parse(
     xml: &str,
-    lists: HashMap<String, List>,
+    lists: Lists,
+    styles: Styles,
     media: HashMap<String, Image>,
 ) -> Result<Document> {
     let mut reader = Reader::from_str(xml);
     let mut parser = Parser {
         lists,
+        styles: Rc::new(styles),
         media,
         ..Parser::default()
     };
@@ -671,6 +887,11 @@ fn is_on(tag: &BytesStart<'_>) -> bool {
     )
 }
 
+/// Whether the on/off attribute `name` is there and on, as in `w:default="1"`.
+fn is_set(tag: &BytesStart<'_>, name: &[u8]) -> bool {
+    matches!(attr(tag, name).as_deref(), Some("1" | "true" | "on"))
+}
+
 fn font_of(family: &str) -> Font {
     let family = family.to_ascii_lowercase();
     let has = |names: &[&str]| names.iter().any(|name| family.contains(name));
@@ -705,6 +926,50 @@ fn highlighter(name: &str) -> Option<[u8; 3]> {
         "darkGray" => [0x80, 0x80, 0x80],
         _ => return None,
     })
+}
+
+/// Apply one child of a `w:rPr` to `run`.
+fn run_prop(run: &mut Format, tag: &BytesStart<'_>) {
+    match tag.name().as_ref() {
+        b"w:b" => run.bold = is_on(tag),
+        b"w:i" => run.italic = is_on(tag),
+        b"w:strike" | b"w:dstrike" => run.strike = is_on(tag),
+        b"w:u" => run.underline = is_on(tag),
+        b"w:sz" => {
+            if let Some(half_points) = attr(tag, b"w:val").and_then(|val| val.parse::<f32>().ok()) {
+                run.size = (half_points / 2.0).clamp(1.0, 400.0);
+            }
+        }
+        b"w:color" => {
+            if let Some(color) = attr(tag, b"w:val").and_then(|val| color_of(&val)) {
+                run.color = color;
+            }
+        }
+        b"w:rFonts" => {
+            if let Some(family) = attr(tag, b"w:ascii") {
+                run.font = font_of(&family);
+            } else if attr(tag, b"w:asciiTheme").is_some() {
+                // The fonts of Word's themes: Calibri, unless the theme was changed.
+                run.font = Font::Calibri;
+            }
+        }
+        b"w:shd" => {
+            if let Some(fill) = attr(tag, b"w:fill") {
+                run.highlight = color_of(&fill);
+            }
+        }
+        b"w:highlight" => {
+            run.highlight = attr(tag, b"w:val").and_then(|name| highlighter(&name));
+        }
+        b"w:vertAlign" => {
+            run.script = match attr(tag, b"w:val").as_deref() {
+                Some("superscript") => Script::Super,
+                Some("subscript") => Script::Sub,
+                _ => Script::Normal,
+            };
+        }
+        _ => {}
+    }
 }
 
 fn color_of(hex: &str) -> Option<[u8; 3]> {
@@ -802,10 +1067,13 @@ impl Parser {
                 self.col = -1;
             }
             b"w:tc" if self.table_depth == 1 => self.col += 1,
-            b"w:p" => self.break_paragraph(Para::default()),
+            b"w:p" => {
+                self.break_paragraph(Para::default());
+                self.use_style(None);
+            }
             b"w:pStyle" => {
                 if let Some(id) = attr(tag, b"w:val") {
-                    self.para().kind = Kind::of_style(&id);
+                    self.use_style(Some(&id));
                 }
             }
             b"w:pageBreakBefore" if self.table_depth == 0 => self.para().page_break = is_on(tag),
@@ -821,7 +1089,8 @@ impl Parser {
                     };
                 }
             }
-            b"w:ind" if !self.in_run => {
+            // A list item is indented by its level, not by what its indent measures.
+            b"w:ind" if !self.in_run && self.para().list == List::None => {
                 let left = attr(tag, b"w:left").or_else(|| attr(tag, b"w:start"));
                 if let Some(left) = left.and_then(|left| left.parse::<f32>().ok()) {
                     let level = (left / INDENT_STEP as f32)
@@ -845,14 +1114,29 @@ impl Parser {
                     };
                 }
             }
+            b"w:ilvl" if !self.in_run => {
+                let level = attr(tag, b"w:val").and_then(|level| level.parse().ok());
+                self.level = level.unwrap_or(0);
+            }
             b"w:numId" if !self.in_run => {
                 let id = attr(tag, b"w:val").unwrap_or_default();
                 // Id 0 switches numbering off; ids we know nothing about are shown as bullets.
-                self.para().list = match self.lists.get(id.as_ref()) {
-                    Some(list) => *list,
+                let list = match self.lists.get(id.as_ref()) {
+                    Some(levels) => {
+                        let level = levels.get(self.level).or(levels.first());
+                        level.copied().unwrap_or(List::Bullet)
+                    }
                     None if id == "0" => List::None,
                     None => List::Bullet,
                 };
+                let level = self.level.min(usize::from(MAX_INDENT)) as u8;
+                let para = self.para();
+                para.list = list;
+                if list != List::None {
+                    // The number of a heading tells its level by itself.
+                    let heading = para.kind.heading_level().is_some();
+                    para.indent = if heading { 0 } else { level };
+                }
             }
             b"w:jc" => {
                 self.para().align = match attr(tag, b"w:val").as_deref() {
@@ -863,11 +1147,12 @@ impl Parser {
             }
             b"w:r" => {
                 self.in_run = true;
-                self.run = self.para().kind.format();
+                self.run = self.base;
             }
             b"w:rPr" => self.in_run_props = self.in_run,
             b"w:t" => self.in_text = self.in_run,
             b"w:tab" if self.in_run && !self.in_run_props => self.push('\t'),
+            b"w:noBreakHyphen" if self.in_run && !self.in_run_props => self.push('-'),
             // A break inside a paragraph becomes a paragraph of the same style.
             b"w:br" | b"w:cr" if self.in_run => {
                 let page = attr(tag, b"w:type").as_deref() == Some("page");
@@ -890,51 +1175,37 @@ impl Parser {
                     self.place_picture(&rel);
                 }
             }
-            name if self.in_run_props => self.run_prop(name, tag),
+            // A character style (a link, an emphasis) gives the run its look.
+            b"w:rStyle" if self.in_run_props => {
+                if let Some(id) = attr(tag, b"w:val") {
+                    self.styles.restyle(&id, &mut self.run);
+                }
+            }
+            _ if self.in_run_props => run_prop(&mut self.run, tag),
             _ => {}
         }
     }
 
-    fn run_prop(&mut self, name: &[u8], tag: &BytesStart<'_>) {
-        match name {
-            b"w:b" => self.run.bold = is_on(tag),
-            b"w:i" => self.run.italic = is_on(tag),
-            b"w:strike" => self.run.strike = is_on(tag),
-            b"w:u" => self.run.underline = is_on(tag),
-            b"w:sz" => {
-                if let Some(half_points) =
-                    attr(tag, b"w:val").and_then(|val| val.parse::<f32>().ok())
-                {
-                    self.run.size = (half_points / 2.0).clamp(1.0, 400.0);
-                }
-            }
-            b"w:color" => {
-                if let Some(color) = attr(tag, b"w:val").and_then(|val| color_of(&val)) {
-                    self.run.color = color;
-                }
-            }
-            b"w:rFonts" => {
-                if let Some(family) = attr(tag, b"w:ascii") {
-                    self.run.font = font_of(&family);
-                }
-            }
-            b"w:shd" => {
-                if let Some(fill) = attr(tag, b"w:fill") {
-                    self.run.highlight = color_of(&fill);
-                }
-            }
-            b"w:highlight" => {
-                self.run.highlight = attr(tag, b"w:val").and_then(|name| highlighter(&name));
-            }
-            b"w:vertAlign" => {
-                self.run.script = match attr(tag, b"w:val").as_deref() {
-                    Some("superscript") => Script::Super,
-                    Some("subscript") => Script::Sub,
-                    _ => Script::Normal,
-                };
-            }
-            _ => {}
+    /// Give the current paragraph the style `id` (`None`: the default one): its kind, what
+    /// the style says of its paragraphs, and the look of its text.
+    fn use_style(&mut self, id: Option<&str>) {
+        let styles = Rc::clone(&self.styles);
+        let id = id.or(styles.default_para.as_deref());
+        let kind = id.map_or(Kind::Normal, |id| styles.kind(id));
+        self.level = 0;
+        let para = self.para();
+        *para = Para {
+            kind,
+            cell: para.cell,
+            page_break: para.page_break,
+            picture: para.picture,
+            ..Para::default()
+        };
+        let chain = id.map(|id| styles.chain(id)).unwrap_or_default();
+        for tag in chain.iter().flat_map(|style| &style.para) {
+            self.open(tag);
         }
+        self.base = styles.format(id, kind);
     }
 
     fn close(&mut self, name: &[u8]) {
@@ -1007,7 +1278,7 @@ mod tests {
         // Two numbered lists: each gets its own numbering instance.
         let (xml, lists, _) = document_xml(&doc);
         assert_eq!(lists, 2);
-        assert!(xml.contains(r#"<w:numId w:val="3"/>"#));
+        assert!(xml.contains(r#"<w:numId w:val="5"/>"#));
         assert_eq!(xml.matches("<w:tc>").count(), 4);
         assert_eq!(xml.matches("<w:tr>").count(), 2);
     }
@@ -1083,8 +1354,8 @@ mod tests {
               <w:tc><w:tbl><w:tr><w:tc><w:p><w:r><w:t>b</w:t></w:r></w:p></w:tc></w:tr></w:tbl><w:p/></w:tc></w:tr></w:tbl>
             <w:p><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>
             </w:body></w:document>"#;
-        let lists = HashMap::from([("7".to_owned(), List::Number)]);
-        let doc = parse(xml, lists, HashMap::new()).unwrap();
+        let lists = HashMap::from([("7".to_owned(), vec![List::Number])]);
+        let doc = parse(xml, lists, Styles::default(), HashMap::new()).unwrap();
         assert_eq!(doc.text(), "A & B\n\none\ntwo\nthree\na\nb\n\nitem");
         assert_eq!(doc.paras()[0].kind, Kind::Heading2);
         assert_eq!(doc.paras()[0].align, Align::Center);
@@ -1112,8 +1383,8 @@ mod tests {
             <w:num w:numId="1"><w:abstractNumId w:val="5"/></w:num>
             <w:num w:numId="2"><w:abstractNumId w:val="4"/></w:num></w:numbering>"#;
         let lists = numbering(xml);
-        assert_eq!(lists.get("1"), Some(&List::Bullet));
-        assert_eq!(lists.get("2"), Some(&List::Number));
+        assert_eq!(lists["1"], [List::Bullet]);
+        assert_eq!(lists["2"], [List::Number, List::Bullet]);
     }
 
     #[test]
@@ -1127,5 +1398,90 @@ mod tests {
         assert_eq!(Kind::of_style("Titre3"), Kind::Heading3);
         assert_eq!(Kind::of_style("Title"), Kind::Title);
         assert_eq!(Kind::of_style("ListParagraph"), Kind::Normal);
+    }
+
+    #[test]
+    fn round_trip_keeps_list_levels_dashes_and_numbered_headings() {
+        let mut doc = Document::default();
+        doc.replace(0..0, "Part\none\ntwo\nthree\ndash\nSub", Format::default());
+        doc.set_kind(0..1, Kind::Heading1);
+        doc.set_kind(5..6, Kind::Heading2);
+        doc.set_list(0..4, List::Number);
+        doc.set_list(4..5, List::Dash);
+        doc.set_list(5..6, List::Number);
+        doc.nest(2..4, true);
+        doc.nest(3..4, true);
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.paras(), doc.paras());
+        assert_eq!(back.markers(), doc.markers());
+        let levels: Vec<u8> = back.paras().iter().map(|para| para.indent).collect();
+        assert_eq!(levels, [0, 0, 1, 2, 0, 0]);
+        let (xml, lists, _) = document_xml(&doc);
+        // The headings share the heading numbering, by level; the list has its own.
+        assert_eq!(lists, 1);
+        assert!(xml.contains(r#"<w:ilvl w:val="1"/><w:numId w:val="3"/>"#));
+        assert!(xml.contains(r#"<w:ilvl w:val="2"/><w:numId w:val="4"/>"#));
+    }
+
+    const WORD_STYLES: &str = r#"<w:styles xmlns:w="x">
+        <w:docDefaults><w:rPrDefault><w:rPr><w:rFonts w:asciiTheme="minorHAnsi"/><w:sz w:val="24"/></w:rPr></w:rPrDefault></w:docDefaults>
+        <w:style w:type="paragraph" w:default="1" w:styleId="Normal"><w:name w:val="Normal"/></w:style>
+        <w:style w:type="paragraph" w:styleId="Titre1"><w:name w:val="heading 1"/><w:basedOn w:val="Normal"/>
+          <w:pPr><w:numPr><w:numId w:val="9"/></w:numPr><w:jc w:val="center"/></w:pPr>
+          <w:rPr><w:b/><w:color w:val="2F5496"/><w:sz w:val="32"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Titre2"><w:name w:val="heading 2"/><w:basedOn w:val="Titre1"/>
+          <w:pPr><w:numPr><w:ilvl w:val="1"/><w:numId w:val="9"/></w:numPr><w:jc w:val="left"/></w:pPr>
+          <w:rPr><w:sz w:val="26"/></w:rPr></w:style>
+        <w:style w:type="paragraph" w:styleId="Chapitre"><w:name w:val="Chapitre"/><w:basedOn w:val="Titre1"/></w:style>
+        <w:style w:type="character" w:styleId="Lien"><w:name w:val="Hyperlink"/><w:rPr><w:u w:val="single"/></w:rPr></w:style>
+        </w:styles>"#;
+    const WORD_NUMBERING: &str = r#"<w:numbering xmlns:w="x"><w:abstractNum w:abstractNumId="2">
+        <w:lvl w:ilvl="0"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1."/></w:lvl>
+        <w:lvl w:ilvl="1"><w:numFmt w:val="decimal"/><w:lvlText w:val="%1.%2."/></w:lvl>
+        <w:lvl w:ilvl="2"><w:numFmt w:val="bullet"/><w:lvlText w:val="-"/></w:lvl></w:abstractNum>
+        <w:num w:numId="9"><w:abstractNumId w:val="2"/></w:num></w:numbering>"#;
+
+    #[test]
+    fn word_headings_numbered_by_their_style_keep_their_numbers() {
+        let lists = numbering(WORD_NUMBERING);
+        assert_eq!(lists["9"], [List::Number, List::Number, List::Dash]);
+        let para = |style: &str, text: &str| {
+            format!(
+                r#"<w:p><w:pPr><w:pStyle w:val="{style}"/></w:pPr><w:r><w:t>{text}</w:t></w:r></w:p>"#
+            )
+        };
+        let body = r#"<w:p><w:r><w:t>body </w:t></w:r><w:r><w:rPr><w:rStyle w:val="Lien"/><w:b/></w:rPr><w:t>link</w:t></w:r></w:p>"#;
+        let item = r#"<w:p><w:pPr><w:numPr><w:ilvl w:val="2"/><w:numId w:val="9"/></w:numPr><w:ind w:left="2160" w:hanging="360"/></w:pPr><w:r><w:t>item</w:t></w:r></w:p>"#;
+        let xml = format!(
+            r#"<w:document xmlns:w="x"><w:body>{}{body}{}{}{}{item}</w:body></w:document>"#,
+            para("Titre1", "One"),
+            para("Titre2", "Sub"),
+            para("Chapitre", "Two"),
+            para("Titre2", "Sub"),
+        );
+        let doc = parse(&xml, lists, read_styles(WORD_STYLES), HashMap::new()).unwrap();
+        let markers: Vec<String> = doc.markers().into_iter().flatten().collect();
+        assert_eq!(markers, ["1.", "1.1.", "2.", "2.1.", "–"]);
+        let kinds: Vec<Kind> = doc.paras().iter().map(|para| para.kind).collect();
+        assert_eq!(
+            kinds[..4],
+            [Kind::Heading1, Kind::Normal, Kind::Heading2, Kind::Heading1]
+        );
+        // A style gives its paragraphs their alignment and their text its look.
+        assert_eq!(doc.paras()[0].align, Align::Center);
+        assert_eq!(doc.paras()[2].align, Align::Left);
+        let heading = doc.formats()[0];
+        assert_eq!(
+            (heading.size, heading.bold, heading.color),
+            (16.0, true, [0x2F, 0x54, 0x96])
+        );
+        let (body, link) = (doc.formats()[4], doc.formats()[9]);
+        assert_eq!(
+            (body.size, body.font, body.underline),
+            (12.0, Font::Calibri, false)
+        );
+        assert!(link.underline && link.bold);
+        // The item is at the third level of its list, whatever its indent measures.
+        assert_eq!(doc.paras()[5].indent, 2);
     }
 }

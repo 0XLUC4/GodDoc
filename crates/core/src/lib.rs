@@ -120,6 +120,14 @@ impl Kind {
         }
     }
 
+    /// The headings, from the highest level down.
+    pub const HEADINGS: [Self; 3] = [Self::Heading1, Self::Heading2, Self::Heading3];
+
+    /// Depth of a heading among the headings (0 for Heading 1); `None` for the other kinds.
+    pub fn heading_level(self) -> Option<usize> {
+        Self::HEADINGS.iter().position(|kind| *kind == self)
+    }
+
     /// Size and weight of text in a paragraph of this kind.
     pub fn format(self) -> Format {
         let (size, bold) = match self {
@@ -157,6 +165,68 @@ pub enum List {
     None,
     Bullet,
     Number,
+    Dash,
+}
+
+impl List {
+    /// List started by typing `typed` then a space at the start of a paragraph ("-", "*", "1.").
+    pub fn of_shortcut(typed: &str) -> Option<Self> {
+        match typed {
+            "-" | "–" | "—" => Some(Self::Dash),
+            "*" | "•" => Some(Self::Bullet),
+            "1." | "1)" => Some(Self::Number),
+            _ => None,
+        }
+    }
+}
+
+/// Bullets of list levels; they repeat every three levels, as the number formats do.
+const BULLETS: [&str; 3] = ["•", "◦", "▪"];
+
+/// `count` as shown at `level` of a numbered list: 1, 2, 3, then a, b, c, then i, ii, iii.
+fn list_number(level: usize, count: u32) -> String {
+    match level % 3 {
+        0 => count.to_string(),
+        1 => letters(count),
+        _ => roman(count),
+    }
+}
+
+/// a, b ... z, aa, ab ...
+fn letters(mut count: u32) -> String {
+    let mut text = Vec::new();
+    while count > 0 {
+        count -= 1;
+        text.push(char::from(b'a' + (count % 26) as u8));
+        count /= 26;
+    }
+    text.iter().rev().collect()
+}
+
+fn roman(mut count: u32) -> String {
+    const PARTS: [(u32, &str); 13] = [
+        (1000, "m"),
+        (900, "cm"),
+        (500, "d"),
+        (400, "cd"),
+        (100, "c"),
+        (90, "xc"),
+        (50, "l"),
+        (40, "xl"),
+        (10, "x"),
+        (9, "ix"),
+        (5, "v"),
+        (4, "iv"),
+        (1, "i"),
+    ];
+    let mut text = String::new();
+    for (value, part) in PARTS {
+        while count >= value {
+            text.push_str(part);
+            count -= value;
+        }
+    }
+    text
 }
 
 /// Place of a paragraph in a table.
@@ -259,7 +329,7 @@ pub struct Para {
     /// Picture shown above the paragraph's text (which then reads as its caption).
     pub picture: Option<Picture>,
     pub spacing: Spacing,
-    /// Indent level, up to [`MAX_INDENT`].
+    /// Indent level, up to [`MAX_INDENT`]; for a list item, its level in the list.
     pub indent: u8,
     /// A line is drawn across the page under the paragraph.
     pub rule: bool,
@@ -513,8 +583,10 @@ impl Document {
         next.page_break = false;
         next.picture = None;
         next.rule = false;
-        if at_end {
+        if at_end && next.kind != Kind::Normal {
             next.kind = Kind::Normal;
+            // The number of a numbered heading stays with the heading.
+            next.list = List::None;
         }
         let added_breaks = inserted.matches('\n').count();
         self.paras
@@ -586,6 +658,75 @@ impl Document {
         for para in &mut self.paras[paras] {
             para.list = list;
         }
+    }
+
+    /// Bullet or number shown in front of each paragraph (`None` outside lists).
+    ///
+    /// Numbered headings count through the whole document, by level: 1. then 1.1. then
+    /// 1.1.1. List items count by indent level, until a paragraph that is not in a list.
+    pub fn markers(&self) -> Vec<Option<String>> {
+        let mut headings = [0_u32; Kind::HEADINGS.len()];
+        let mut counts = [0_u32; MAX_INDENT as usize + 1];
+        let mut cell = None;
+        let mut marker = |para: &Para| {
+            if para.cell != cell {
+                counts.fill(0);
+                cell = para.cell;
+            }
+            if para.list == List::None {
+                counts.fill(0);
+                return None;
+            }
+            if let (Some(level), List::Number) = (para.kind.heading_level(), para.list) {
+                counts.fill(0);
+                headings[level] += 1;
+                headings[level + 1..].fill(0);
+                // A heading under no heading of the levels above counts from its own level.
+                let from = headings[..level]
+                    .iter()
+                    .position(|count| *count > 0)
+                    .unwrap_or(level);
+                let numbers = headings[from..=level].iter();
+                return Some(numbers.map(|count| format!("{}.", count.max(&1))).collect());
+            }
+            let level = usize::from(para.indent.min(MAX_INDENT));
+            counts[level + 1..].fill(0);
+            Some(match para.list {
+                List::Bullet => BULLETS[level % BULLETS.len()].to_owned(),
+                List::Dash => "–".to_owned(),
+                _ => {
+                    counts[level] += 1;
+                    format!("{}.", list_number(level, counts[level]))
+                }
+            })
+        };
+        self.paras.iter().map(&mut marker).collect()
+    }
+
+    /// Move the paragraphs `paras` one level down (`deeper`) or up their hierarchy: a heading
+    /// becomes the next heading, a list item changes level. True when anything changed.
+    pub fn nest(&mut self, paras: Range<usize>, deeper: bool) -> bool {
+        let before = self.paras.clone();
+        for para in paras {
+            if let Some(level) = self.paras[para].kind.heading_level() {
+                let level = if deeper {
+                    level + 1
+                } else {
+                    level.saturating_sub(1)
+                };
+                if let Some(kind) = Kind::HEADINGS.get(level) {
+                    self.set_kind(para..para + 1, *kind);
+                }
+            } else if self.paras[para].list != List::None {
+                let indent = &mut self.paras[para].indent;
+                *indent = if deeper {
+                    (*indent + 1).min(MAX_INDENT)
+                } else {
+                    indent.saturating_sub(1)
+                };
+            }
+        }
+        self.paras != before
     }
 
     /// Stretches of equally formatted characters, as character ranges covering the document.
@@ -1174,5 +1315,70 @@ mod tests {
         doc.delete_table(0);
         assert_eq!(doc.text(), "x");
         consistent(&doc);
+    }
+
+    fn shown(doc: &Document) -> Vec<String> {
+        let markers = doc.markers().into_iter();
+        markers.map(Option::unwrap_or_default).collect()
+    }
+
+    #[test]
+    fn numbered_headings_count_by_level_through_the_document() {
+        let mut doc = doc("Intro\ntext\nScope\nGoals\nDetail\nMethod\nSub");
+        for (para, kind) in [
+            (0, Kind::Heading1),
+            (2, Kind::Heading2),
+            (3, Kind::Heading2),
+            (4, Kind::Heading3),
+            (5, Kind::Heading1),
+            (6, Kind::Heading2),
+        ] {
+            doc.set_kind(para..para + 1, kind);
+            doc.set_list(para..para + 1, List::Number);
+        }
+        // Text between two headings does not start their numbers over.
+        assert_eq!(
+            shown(&doc),
+            ["1.", "", "1.1.", "1.2.", "1.2.1.", "2.", "2.1."]
+        );
+        // Tab makes a heading a sub-heading, Shift+Tab brings it back.
+        assert!(doc.nest(5..6, true));
+        assert_eq!(doc.paras()[5].kind, Kind::Heading2);
+        assert_eq!(shown(&doc)[5..], ["1.3.", "1.4."]);
+        assert!(doc.nest(5..6, false) && !doc.nest(5..6, false));
+        assert_eq!(doc.paras()[5].kind, Kind::Heading1);
+    }
+
+    #[test]
+    fn lists_have_levels() {
+        let mut doc = doc("a\nb\nc\nd\ne\nplain\nf\ng");
+        doc.set_list(0..5, List::Number);
+        doc.set_list(6..7, List::Number);
+        doc.set_list(7..8, List::Dash);
+        assert!(doc.nest(1..4, true) && doc.nest(2..3, true));
+        // Each level counts on its own and starts over under a new item of the level above.
+        assert_eq!(shown(&doc), ["1.", "a.", "i.", "b.", "2.", "", "1.", "–"]);
+        doc.set_list(1..4, List::Bullet);
+        assert_eq!(shown(&doc)[..5], ["1.", "◦", "▪", "◦", "2."]);
+        // Text that is in no list has no level to change.
+        assert!(!doc.nest(5..6, true));
+        assert_eq!([letters(26), letters(27), roman(14)], ["z", "aa", "xiv"]);
+        assert_eq!(List::of_shortcut("-"), Some(List::Dash));
+        assert_eq!(List::of_shortcut("1."), Some(List::Number));
+        assert_eq!(List::of_shortcut("a"), None);
+    }
+
+    #[test]
+    fn the_number_of_a_heading_stays_with_it() {
+        let mut doc = doc("Title");
+        doc.set_kind(0..1, Kind::Heading1);
+        doc.set_list(0..1, List::Number);
+        doc.replace(5..5, "\n", Format::default());
+        assert_eq!(doc.paras()[1].kind, Kind::Normal);
+        assert_eq!(doc.paras()[1].list, List::None);
+        // A list item, though, is followed by another.
+        doc.set_list(1..2, List::Dash);
+        doc.replace(6..6, "x\n", Format::default());
+        assert_eq!(doc.paras()[2].list, List::Dash);
     }
 }
