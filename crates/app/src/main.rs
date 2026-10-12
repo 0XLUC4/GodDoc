@@ -1,4 +1,4 @@
-//! GodDoc — desktop entry point.
+//! GodDoc: desktop entry point.
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 mod app;
@@ -8,6 +8,7 @@ mod layout;
 mod platform;
 mod theme;
 mod toasts;
+mod updates;
 mod widgets;
 
 pub const APP_NAME: &str = "GodDoc";

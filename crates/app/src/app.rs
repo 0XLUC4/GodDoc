@@ -476,6 +476,7 @@ enum Closing {
 }
 
 pub struct GodApp {
+    updates: crate::updates::Updates,
     tabs: Vec<DocTab>,
     active: usize,
     next_id: u64,
@@ -513,8 +514,10 @@ impl GodApp {
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         layout::install_fonts(&mut fonts);
+        crate::updates::add_bold_font(&mut fonts);
         cc.egui_ctx.set_fonts(fonts);
         let mut app = Self {
+            updates: crate::updates::Updates::default(),
             tabs: Vec::new(),
             active: 0,
             next_id: 0,
@@ -539,6 +542,7 @@ impl GodApp {
                 .unwrap_or_default(),
             textures: HashMap::new(),
         };
+        app.updates.start(&cc.egui_ctx);
         app.new_tab();
         for path in files {
             app.open_path(&path);
@@ -944,6 +948,8 @@ impl GodApp {
         if requested && !self.quit && self.tabs.iter().any(|tab| tab.dirty) {
             ctx.send_viewport_cmd(ViewportCommand::CancelClose);
             self.closing = Some(Closing::Window);
+        } else if requested {
+            self.updates.relaunch();
         }
     }
 
@@ -1014,6 +1020,7 @@ impl GodApp {
                 if widgets::icon_button(ui, glyph, tip).clicked() {
                     clicked.push(Cmd::ToggleTheme);
                 }
+                self.updates.button(ui);
             });
         });
         if let Some(index) = select {
@@ -1874,6 +1881,7 @@ impl eframe::App for GodApp {
             self.run(&ctx, cmd);
         }
         self.closing_dialog(&ctx);
+        self.updates.show(&ctx);
         self.toasts.show(&ctx);
     }
 
