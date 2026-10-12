@@ -5,6 +5,7 @@
 //! (row by row), each cell holding one or more paragraphs.
 
 pub mod docx;
+pub mod export;
 
 use std::ops::Range;
 
@@ -157,6 +158,8 @@ pub enum Align {
     Left,
     Center,
     Right,
+    /// Both edges straight: the words of each line but the last are spread.
+    Justify,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]

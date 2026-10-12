@@ -37,6 +37,16 @@ pub fn pick_save(name: &str) -> Option<PathBuf> {
     dialog().set_file_name(name).save_file()
 }
 
+/// Ask where to write a copy of the document `name` in another format.
+pub fn pick_export(name: &str, label: &str, extension: &str) -> Option<PathBuf> {
+    let stem = Path::new(name).file_stem().unwrap_or(name.as_ref());
+    let name = format!("{}.{extension}", stem.to_string_lossy());
+    rfd::FileDialog::new()
+        .add_filter(label, &[extension])
+        .set_file_name(name)
+        .save_file()
+}
+
 /// Write through a temporary file so a failure never leaves a half-written document.
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut temp_name = target

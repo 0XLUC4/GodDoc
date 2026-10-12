@@ -27,6 +27,8 @@ const GRIP_ZONE: f32 = 44.0;
 /// Narrowest a picture can be made, in points.
 const MIN_PICTURE: f32 = 16.0;
 const HANDLE: f32 = 9.0;
+/// Colour of the formatting marks: seen, and not taken for text.
+const MARK_COLOR: Color32 = Color32::from_rgb(0x5B, 0x8D, 0xD6);
 /// Seconds the caret shows, then hides: the blink of Windows.
 const CARET_BLINK: f64 = 0.53;
 /// Height of the caret, in font sizes.
@@ -71,6 +73,8 @@ pub struct View {
     pub found: Option<Range<usize>>,
     /// Where the right-click menu is open.
     menu_at: Option<egui::Pos2>,
+    /// Show what stands for spaces, tabs and the ends of paragraphs.
+    pub marks: bool,
     /// Where the caret is, and since when: its blink starts over when it moves.
     caret: (usize, f64),
 }
@@ -83,6 +87,8 @@ pub struct Output {
     /// The edit was a move or a resize, not typing: it is its own undo step.
     pub structural: bool,
     pub pages: usize,
+    /// Page (0 for the first) each paragraph starts on.
+    pub para_pages: Vec<usize>,
     /// Table cells on screen, for tests that click in them.
     #[cfg(test)]
     cells: Vec<Rect>,
@@ -541,6 +547,22 @@ fn paint_caret(ui: &Ui, x: f32, top: f32, bottom: f32, index: usize, view: &mut 
         .request_repaint_after(std::time::Duration::from_secs_f64(wait));
 }
 
+/// Formatting marks of the text of `galley`, shown at `at`.
+fn paint_marks(ui: &Ui, galley: &egui::Galley, at: egui::Pos2, doc: &Document, zoom: f32) {
+    let visible = ui.clip_rect().translate(-at.to_vec2());
+    for mark in layout::marks(galley, doc.formats(), zoom, visible) {
+        let font = FontId::proportional(mark.size * 0.85);
+        let centre = egui::Align2::CENTER_CENTER;
+        ui.painter().text(
+            mark.pos + at.to_vec2(),
+            centre,
+            mark.glyph,
+            font,
+            MARK_COLOR,
+        );
+    }
+}
+
 /// Underlines of the text of `galley`, shown at `at`.
 fn paint_underlines(ui: &Ui, galley: &egui::Galley, at: egui::Pos2, doc: &Document, zoom: f32) {
     let visible = ui.clip_rect().translate(-at.to_vec2());
@@ -633,6 +655,7 @@ pub fn show(
         before: None,
         structural: false,
         pages: 1,
+        para_pages: Vec::new(),
         #[cfg(test)]
         cells: Vec::new(),
     };
@@ -645,6 +668,7 @@ pub fn show(
     ScrollArea::both().auto_shrink(false).show(ui, |ui| {
         let pages = layout::layout(ui.painter(), doc, zoom);
         out.pages = pages.pages;
+        out.para_pages.clone_from(&pages.para_pages);
         let page_size = layout::page_size(doc.page, zoom);
         let step = layout::page_step(doc.page, zoom);
         let height = (pages.pages - 1) as f32 * step + page_size.y;
@@ -752,6 +776,9 @@ pub fn show(
         // The galley is that of the text typed: the formats are only its own once the edit is in.
         if output.galley.text() == doc.text() {
             paint_underlines(ui, &output.galley, output.galley_pos, doc, zoom);
+            if view.marks {
+                paint_marks(ui, &output.galley, output.galley_pos, doc, zoom);
+            }
         }
         if let Some(range) = output
             .cursor_range

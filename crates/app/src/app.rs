@@ -167,6 +167,13 @@ enum Cmd {
     PageMargins(Margins),
     InsertText(&'static str),
     InsertDate,
+    /// Pick up the look of the selection, to give it to what is selected next.
+    FormatPainter,
+    /// Show or hide the formatting marks.
+    Marks,
+    /// Insert a table of contents where the caret is.
+    Contents,
+    Export(Export),
     /// Open the find and replace bar.
     Find,
     CloseFind,
@@ -174,6 +181,22 @@ enum Cmd {
     FindNext(bool),
     ReplaceOne,
     ReplaceAll,
+}
+
+/// A format a copy of the document can be written in.
+#[derive(Clone, Copy)]
+enum Export {
+    Markdown,
+    Html,
+}
+
+/// A table of contents just inserted, whose page numbers wait for the pages to be laid out
+/// again (the table itself pushes the headings down).
+struct Contents {
+    /// (paragraph of the line, paragraph of its heading).
+    lines: Vec<(usize, usize)>,
+    /// Layouts left to settle on.
+    tries: u8,
 }
 
 /// Tab of the ribbon: which set of tools shows under the tab row.
@@ -231,6 +254,11 @@ struct DocTab {
     pending: Option<Format>,
     /// Number of pages, as last laid out.
     pages: usize,
+    /// Page (0 for the first) each paragraph starts on, as last laid out.
+    para_pages: Vec<usize>,
+    /// Format painter: the look picked up, and the selection it was picked from.
+    painter: Option<(Format, Range<usize>)>,
+    contents: Option<Contents>,
     view: editor::View,
 }
 
@@ -248,6 +276,9 @@ impl DocTab {
             selection: 0..0,
             pending: None,
             pages: 1,
+            para_pages: Vec::new(),
+            painter: None,
+            contents: None,
             view: editor::View::default(),
         }
     }
@@ -406,6 +437,99 @@ impl DocTab {
         set_cursor(ctx, self.editor_id(), &self.selection);
     }
 
+    /// Insert a table of contents in front of the caret's paragraph: a line per heading,
+    /// with its number and its page. False when there is no heading, or in a table.
+    fn insert_contents(&mut self) -> bool {
+        let doc = &self.doc;
+        let markers = doc.markers();
+        let para = doc.para_at(self.selection.start);
+        let here = doc.paras()[para];
+        // (paragraph of the heading, its level, what its line reads).
+        let mut entries = Vec::new();
+        for (index, (text, heading)) in doc.text().split('\n').zip(doc.paras()).enumerate() {
+            let level = heading
+                .kind
+                .heading_level()
+                .filter(|_| !text.trim().is_empty());
+            let Some(level) = level else {
+                continue;
+            };
+            let page = self.para_pages.get(index).map_or(1, |page| page + 1);
+            let number = markers[index].as_ref().map(|number| format!("{number} "));
+            let line = format!("{}{text}\t{page}", number.unwrap_or_default());
+            entries.push((index, level as u8, line));
+        }
+        if entries.is_empty() || here.cell.is_some() {
+            return false;
+        }
+        let at = doc.para_chars(para).start;
+        let lines: Vec<&str> = entries.iter().map(|entry| entry.2.as_str()).collect();
+        let title = "Contents";
+        let text = format!("{title}\n{}\n", lines.join("\n"));
+        let count = entries.len() + 1;
+        let done = self.restructure(|doc| {
+            doc.replace(at..at, &text, Kind::Normal.format());
+            // The lines are plain text; the paragraph they push down stays as it was.
+            doc.edit_paras(para..para + count, |line| *line = Default::default());
+            doc.edit_paras(para + count..para + count + 1, |pushed| *pushed = here);
+            for (offset, entry) in entries.iter().enumerate() {
+                let line = para + 1 + offset;
+                doc.edit_paras(line..line + 1, |line| line.indent = entry.1);
+            }
+            doc.restyle(at..at + title.chars().count(), |format| {
+                format.bold = true;
+                format.size = 16.0;
+            });
+            Some(at)
+        });
+        // Headings from the caret on are `count` paragraphs further.
+        let moved = |heading: usize| heading + if heading >= para { count } else { 0 };
+        let lines = entries.iter().enumerate();
+        self.contents = Some(Contents {
+            lines: lines
+                .map(|(offset, entry)| (para + 1 + offset, moved(entry.0)))
+                .collect(),
+            tries: 4,
+        });
+        done
+    }
+
+    /// Give the lines of the table of contents just inserted the pages of the new layout.
+    fn settle_contents(&mut self) {
+        let Some(mut contents) = self.contents.take() else {
+            return;
+        };
+        if self.para_pages.len() != self.doc.paras().len() || contents.tries == 0 {
+            return;
+        }
+        let mut changed = false;
+        // From the last line up: a number that changes length moves what follows it.
+        for (line, heading) in contents.lines.iter().rev() {
+            let chars = self.doc.para_chars(*line);
+            let text: String = self
+                .doc
+                .text()
+                .chars()
+                .skip(chars.start)
+                .take(chars.len())
+                .collect();
+            let (Some(tab), Some(page)) = (text.rfind('\t'), self.para_pages.get(*heading)) else {
+                return;
+            };
+            let page = (page + 1).to_string();
+            if text[tab + 1..] != page {
+                let from = chars.start + text[..=tab].chars().count();
+                let format = self.doc.format_at(from);
+                self.doc.replace(from..chars.end, &page, format);
+                changed = true;
+            }
+        }
+        if changed {
+            contents.tries -= 1;
+            self.contents = Some(contents);
+        }
+    }
+
     /// Mark the match after (or before) the current one, wrapping around.
     fn find_next(&mut self, find: &Find, forward: bool) {
         let found = self.doc.find(&find.query, find.match_case);
@@ -500,6 +624,8 @@ pub struct GodApp {
     title: String,
     /// The navigation pane (headings) is shown.
     show_outline: bool,
+    /// Spaces, tabs and ends of paragraphs are shown.
+    show_marks: bool,
     /// The home screen is shown instead of the active document.
     home: bool,
     /// Documents opened or saved lately, latest first.
@@ -539,6 +665,7 @@ impl GodApp {
             quit: false,
             title: String::new(),
             show_outline: get("outline").is_some_and(|value| value == "1"),
+            show_marks: get("marks").is_some_and(|value| value == "1"),
             home: files.is_empty(),
             find: Find::default(),
             ribbon: Ribbon::default(),
@@ -837,6 +964,38 @@ impl GodApp {
             }
             Cmd::InsertText(text) => tab.insert_text(ctx, text),
             Cmd::InsertDate => tab.insert_text(ctx, &today()),
+            Cmd::FormatPainter => {
+                tab.painter = match tab.painter.take() {
+                    Some(_) => None,
+                    None => Some((tab.current(), tab.selection.clone())),
+                };
+            }
+            Cmd::Marks => self.show_marks = !self.show_marks,
+            Cmd::Contents => {
+                if !tab.insert_contents() {
+                    let why = "Give the document headings first, and put the caret outside tables";
+                    self.toasts.error(why);
+                }
+                set_cursor(ctx, editor_id, &tab.selection);
+            }
+            Cmd::Export(export) => {
+                let (label, extension) = match export {
+                    Export::Markdown => ("Markdown", "md"),
+                    Export::Html => ("Web page", "html"),
+                };
+                if let Some(path) = platform::pick_export(&tab.name, label, extension) {
+                    let text = match export {
+                        Export::Markdown => goddoc_core::export::markdown(&tab.doc),
+                        Export::Html => goddoc_core::export::html(&tab.doc, &tab.name),
+                    };
+                    match platform::write_atomic(&path, text.as_bytes()) {
+                        Ok(()) => self
+                            .toasts
+                            .success(format!("Exported {}", file_name(&path))),
+                        Err(err) => self.toasts.error(err),
+                    }
+                }
+            }
             // The find bar keeps the keyboard: these do not hand it back to the page.
             Cmd::Find => {
                 self.find.open = true;
@@ -909,6 +1068,7 @@ impl GodApp {
             (ctrl, Key::L, Cmd::Edit(Edit::Align(ParaAlign::Left))),
             (ctrl, Key::E, Cmd::Edit(Edit::Align(ParaAlign::Center))),
             (ctrl, Key::R, Cmd::Edit(Edit::Align(ParaAlign::Right))),
+            (ctrl, Key::J, Cmd::Edit(Edit::Align(ParaAlign::Justify))),
             (ctrl, Key::S, Cmd::Save),
             (ctrl, Key::Z, Cmd::Undo),
             (ctrl, Key::Y, Cmd::Redo),
@@ -1185,6 +1345,7 @@ impl GodApp {
                 (icon::TEXT_ALIGN_LEFT, "Align left", ParaAlign::Left),
                 (icon::TEXT_ALIGN_CENTER, "Center", ParaAlign::Center),
                 (icon::TEXT_ALIGN_RIGHT, "Align right", ParaAlign::Right),
+                (icon::TEXT_ALIGN_JUSTIFY, "Justify", ParaAlign::Justify),
             ];
             for (glyph, tip, align) in aligns {
                 if widgets::toggle_button(ui, glyph, tip, para.align == align).clicked() {
@@ -1230,6 +1391,11 @@ impl GodApp {
                     }
                 }
             });
+            let painting = self.tabs[self.active].painter.is_some();
+            let tip = "Format painter: click, then select the text that takes this look";
+            if widgets::toggle_button(ui, icon::PAINT_BRUSH, tip, painting).clicked() {
+                clicked.push(Cmd::FormatPainter);
+            }
             if widgets::icon_button(ui, icon::ERASER, "Clear formatting").clicked() {
                 clicked.push(Cmd::Edit(Edit::ClearFormat));
             }
@@ -1408,10 +1574,18 @@ impl GodApp {
                         Cmd::SaveAs,
                     );
                     divider(ui, p);
+                    let markdown = Cmd::Export(Export::Markdown);
+                    tool(ui, p, clicked, icon::FILE_MD, "Markdown", false, markdown);
+                    let page = Cmd::Export(Export::Html);
+                    tool(ui, p, clicked, icon::FILE_HTML, "Web page", false, page);
+                    divider(ui, p);
                     tool(ui, p, clicked, icon::X, "Close", false, Cmd::CloseTab);
                     tool(ui, p, clicked, icon::SIGN_OUT, "Quit", false, Cmd::Quit);
                 }
                 Ribbon::Insert => {
+                    let contents = icon::LIST_MAGNIFYING_GLASS;
+                    tool(ui, p, clicked, contents, "Contents", false, Cmd::Contents);
+                    divider(ui, p);
                     tool(
                         ui,
                         p,
@@ -1568,6 +1742,8 @@ impl GodApp {
                         self.show_outline,
                         Cmd::Outline,
                     );
+                    let marks = self.show_marks;
+                    tool(ui, p, clicked, icon::PARAGRAPH, "Marks", marks, Cmd::Marks);
                     divider(ui, p);
                     let zoom_out = icon::MAGNIFYING_GLASS_MINUS;
                     tool(
@@ -1730,6 +1906,7 @@ impl GodApp {
         let textures = &mut self.textures;
         let tab = &mut self.tabs[self.active];
         let typing = tab.typing();
+        tab.view.marks = self.show_marks;
         // What the right-click menu shows, as things are before this frame's edits.
         let palette = Palette::of(ui);
         let format = tab.current();
@@ -1748,6 +1925,16 @@ impl GodApp {
             },
         );
         tab.pages = out.pages;
+        tab.para_pages = out.para_pages;
+        // Typing over a table of contents that waits for its pages leaves it as typed.
+        if out.before.is_some() {
+            tab.contents = None;
+        } else {
+            tab.settle_contents();
+        }
+        if tab.contents.is_some() {
+            ui.ctx().request_repaint();
+        }
         if let Some(before) = out.before {
             // Typing joins the step in progress; a move or a resize is a step of its own.
             if out.structural || now - tab.last_edit > UNDO_GROUP_SECONDS {
@@ -1767,6 +1954,16 @@ impl GodApp {
             // The caret moved: a format picked for the old place no longer applies.
             tab.selection = selection;
             tab.pending = None;
+        }
+        // Format painter: the look picked up goes to what is selected next, once it is.
+        let released = !ui.input(|input| input.pointer.any_down());
+        let target = tab.selection.clone();
+        let brush = tab.painter.clone().filter(|(_, from)| *from != target);
+        if let Some((look, _)) = brush.filter(|_| released && !target.is_empty()) {
+            tab.painter = None;
+            tab.checkpoint(tab.doc.clone());
+            tab.doc.restyle(target, |format| *format = look);
+            tab.touched();
         }
     }
 
@@ -1919,6 +2116,8 @@ impl eframe::App for GodApp {
         storage.set_string("zoom", self.zoom.to_string());
         let outline = if self.show_outline { "1" } else { "0" };
         storage.set_string("outline", outline.to_owned());
+        let marks = if self.show_marks { "1" } else { "0" };
+        storage.set_string("marks", marks.to_owned());
         let recent: Vec<String> = self
             .recent
             .iter()

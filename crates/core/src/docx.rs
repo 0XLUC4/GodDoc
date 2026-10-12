@@ -471,6 +471,7 @@ fn para_props(para: Para, num: Option<(u32, u32)>) -> String {
         Align::Left => None,
         Align::Center => Some("center"),
         Align::Right => Some("right"),
+        Align::Justify => Some("both"),
     };
     if let Some(align) = align {
         xml.push_str(&format!(r#"<w:jc w:val="{align}"/>"#));
@@ -1142,6 +1143,7 @@ impl Parser {
                 self.para().align = match attr(tag, b"w:val").as_deref() {
                     Some("center") => Align::Center,
                     Some("right" | "end") => Align::Right,
+                    Some("both" | "distribute") => Align::Justify,
                     _ => Align::Left,
                 };
             }

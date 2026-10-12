@@ -348,6 +348,66 @@ pub struct PageLayout {
     pub blocks: Vec<Block>,
     /// Lines under paragraphs: (left end, length).
     pub rules: Vec<(Pos2, f32)>,
+    /// Page (0 for the first) each paragraph starts on.
+    pub para_pages: Vec<usize>,
+}
+
+/// A formatting mark: what stands for a space, a tab or the end of a paragraph.
+pub struct Mark {
+    /// Its centre, relative to the galley.
+    pub pos: Pos2,
+    pub glyph: &'static str,
+    /// Size on screen of the text it stands in.
+    pub size: f32,
+}
+
+/// The formatting marks of the rows of `galley` that show in `visible`; `formats` has the
+/// format of each of its characters.
+pub fn marks(galley: &Galley, formats: &[Format], zoom: f32, visible: Rect) -> Vec<Mark> {
+    let mut marks = Vec::new();
+    let mut start = 0;
+    let size_at = |index: usize| {
+        let format = formats.get(index).or(formats.last());
+        format.map_or(11.0, |format| format.size) * zoom
+    };
+    for row in &galley.rows {
+        let first = start;
+        start += row.char_count_including_newline().0;
+        if row.max_y() < visible.top() || row.min_y() > visible.bottom() {
+            continue;
+        }
+        for (index, glyph) in row.glyphs.iter().enumerate() {
+            let sign = match glyph.chr {
+                ' ' => "·",
+                '\t' => "→",
+                '\u{a0}' => "°",
+                _ => continue,
+            };
+            let size = size_at(first + index);
+            let centre = vec2(
+                glyph.pos.x + glyph.advance_width / 2.0,
+                glyph.pos.y - size * 0.3,
+            );
+            marks.push(Mark {
+                pos: row.pos + centre,
+                glyph: sign,
+                size,
+            });
+        }
+        // The last row of a paragraph ends on its break, or on the end of the text.
+        if row.ends_with_newline || start >= formats.len() {
+            let size = size_at(first + row.glyphs.len());
+            let end = row.glyphs.last();
+            let x = end.map_or(0.0, |glyph| glyph.max_x()) + size * 0.3;
+            let baseline = end.map_or(size * 0.95, |glyph| glyph.pos.y);
+            marks.push(Mark {
+                pos: row.pos + vec2(x, baseline - size * 0.3),
+                glyph: "¶",
+                size,
+            });
+        }
+    }
+    marks
 }
 
 impl PageLayout {
@@ -439,6 +499,7 @@ fn para_galley(
 ) -> Arc<Galley> {
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(1.0);
+    job.justify = para.align == Align::Justify;
     let spacing = para.spacing.factor();
     if formats.is_empty() {
         // An empty section still gives the caret its height.
@@ -482,7 +543,7 @@ fn stack(rows: &mut [PlacedRow], origin: Pos2, wrap: f32, align: Align) -> f32 {
 pub fn shift(align: Align, wrap: f32, width: f32) -> f32 {
     let free = (wrap - width).max(0.0);
     match align {
-        Align::Left => 0.0,
+        Align::Left | Align::Justify => 0.0,
         Align::Center => free / 2.0,
         Align::Right => free,
     }
@@ -594,6 +655,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     let mut pictures = Vec::new();
     let mut blocks: Vec<Block> = Vec::new();
     let mut rules = Vec::new();
+    let mut para_pages = Vec::with_capacity(paras.len());
     // Table the last block is, to grow it row by row.
     let mut open_table = None;
     // First galley row of each paragraph.
@@ -644,6 +706,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             let rows = &mut galley.rows[rows_of(index)];
             // A picture stays with the first line under it.
             placer.fit(picture_height(para) + rows[0].size.y);
+            para_pages.push(placer.page);
             let top = placer.y;
             show_picture(index, pos2(0.0, placer.y));
             placer.y += picture_height(para);
@@ -693,6 +756,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         }
         let row_height = heights.values().copied().fold(0.0, f32::max) + 2.0 * pad;
         placer.fit(row_height);
+        para_pages.resize(end, placer.page);
         let top = placer.y;
         let mut used: HashMap<u16, f32> = HashMap::new();
         for index in index..end {
@@ -750,5 +814,6 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         pictures,
         blocks,
         rules,
+        para_pages,
     }
 }
