@@ -40,9 +40,9 @@ fn run(
 ) -> Result<Option<&'static str>, String> {
     let mut child = Command::new("powershell")
         .args(["-NoProfile", "-STA", "-Command", SCRIPT])
-        .env("GODPDF_PRINT_DIR", dir)
-        .env("GODPDF_PRINT_NAME", name)
-        .env("GODPDF_PRINT_PAGES", pages.to_string())
+        .env("GODDOC_PRINT_DIR", dir)
+        .env("GODDOC_PRINT_NAME", name)
+        .env("GODDOC_PRINT_PAGES", pages.to_string())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::null())

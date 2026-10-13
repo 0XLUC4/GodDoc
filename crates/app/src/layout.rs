@@ -389,6 +389,43 @@ const TRACKED: [u8; 3] = [0xB4, 0x23, 0x8C];
 /// Background of text a comment is about.
 const NOTED: [u8; 3] = [0xFF, 0xE9, 0xA8];
 
+thread_local! {
+    /// The pages are shown dark, their colours turned over: only in the window, which sets
+    /// it for its own thread, never in what is printed, which is drawn in another.
+    static DARK_PAGE: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+pub fn set_dark_page(on: bool) {
+    DARK_PAGE.with(|dark| dark.set(on));
+}
+
+/// A colour of the document as the page shows it: on a dark page, as light as it was dark,
+/// of the same hue.
+fn on_page([r, g, b]: [u8; 3]) -> [u8; 3] {
+    if !DARK_PAGE.with(std::cell::Cell::get) {
+        return [r, g, b];
+    }
+    let shift = 255 - i16::from(r.max(g).max(b)) - i16::from(r.min(g).min(b));
+    [r, g, b].map(|part| (i16::from(part) + shift).clamp(0, 255) as u8)
+}
+
+/// Colour of the sheets.
+pub fn paper() -> Color32 {
+    let [r, g, b] = on_page([255, 255, 255]);
+    Color32::from_rgb(r.max(0x1E), g.max(0x1E), b.max(0x1E))
+}
+
+/// A colour drawn on the sheets (borders, page numbers) as the page shows it.
+pub fn ink(color: Color32) -> Color32 {
+    let [r, g, b] = on_page([color.r(), color.g(), color.b()]);
+    Color32::from_rgb(r, g, b)
+}
+
+/// Left inset a paragraph gets from its indent level alone.
+pub fn level_room(para: &Para, zoom: f32) -> f32 {
+    f32::from(para.indent) * INDENT_STEP * zoom
+}
+
 /// How `format` shows: a tracked change and a comment each add their mark to the look the
 /// text was given.
 pub fn shown(format: &Format) -> Format {
@@ -401,6 +438,8 @@ pub fn shown(format: &Format) -> Format {
     if format.note != 0 && shown.highlight.is_none() {
         shown.highlight = Some(NOTED);
     }
+    shown.color = on_page(shown.color);
+    shown.highlight = shown.highlight.map(on_page);
     shown
 }
 

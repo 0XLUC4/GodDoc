@@ -159,7 +159,7 @@ fn paint_pages(
         if !plain {
             painter.add(shadow.as_shape(sheet, CornerRadius::same(corners)));
         }
-        painter.rect_filled(sheet, CornerRadius::same(corners), Color32::WHITE);
+        painter.rect_filled(sheet, CornerRadius::same(corners), layout::paper());
         // The header in the middle of the top margin, the footer in that of the bottom one;
         // each at the left, in the middle and at the right of the text area.
         let (from, to) = (sheet.left() + left, sheet.right() - right);
@@ -180,7 +180,7 @@ fn paint_pages(
             for (zone, x, anchor) in zones {
                 if !zone.trim().is_empty() {
                     let said = goddoc_core::Banner::on_page(zone, page + 1, pages.pages);
-                    let ink = Color32::from_gray(0x44);
+                    let ink = layout::ink(Color32::from_gray(0x44));
                     painter.text(pos2(x, y), anchor, said, number_font.clone(), ink);
                 }
             }
@@ -189,13 +189,13 @@ fn paint_pages(
     for cell in &pages.cells {
         let rect = cell.rect.translate(origin);
         if ui.is_rect_visible(rect) {
-            let border = Stroke::new(1.0, TABLE_BORDER);
+            let border = Stroke::new(1.0, layout::ink(TABLE_BORDER));
             painter.rect_stroke(rect, 0.0, border, StrokeKind::Middle);
         }
     }
     for (left, length) in &pages.rules {
         let left = *left + origin;
-        let line = Stroke::new(1.0, TABLE_BORDER);
+        let line = Stroke::new(1.0, layout::ink(TABLE_BORDER));
         painter.hline(left.x..=left.x + length, left.y, line);
     }
     for marker in &pages.markers {

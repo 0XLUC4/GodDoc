@@ -973,6 +973,10 @@ impl Document {
         for para in paras {
             let before = self.paras[para].kind.format();
             self.paras[para].kind = kind;
+            // A title is no item of a list; only headings keep their numbers.
+            if kind != Kind::Normal && kind.heading_level().is_none() {
+                self.paras[para].list = List::None;
+            }
             let chars = self.para_chars(para);
             self.restyle(chars, |format| {
                 format.size = look.size;
@@ -1185,6 +1189,23 @@ impl Document {
             })
     }
 
+    /// Put the paragraphs `paras` in the order of their words, from A to Z or back. False
+    /// when there is nothing to sort, or when some are in a table.
+    pub fn sort_paras(&mut self, paras: Range<usize>, descending: bool) -> bool {
+        let mut blocks = self.blocks();
+        let range = paras.start..paras.end.min(blocks.len());
+        let in_table = |block: &Block| block.2.cell.is_some();
+        if range.len() < 2 || blocks[range.clone()].iter().any(in_table) {
+            return false;
+        }
+        blocks[range.clone()].sort_by_cached_key(|block| block.0.to_lowercase());
+        if descending {
+            blocks[range].reverse();
+        }
+        self.rebuild(blocks);
+        true
+    }
+
     /// Columns the cell `cell` takes: more than one when cells were joined.
     pub fn cell_span(&self, cell: Cell) -> u16 {
         let first = self.paras.iter().find(|para| para.cell == Some(cell));
@@ -1372,6 +1393,19 @@ impl Document {
 
     /// Character ranges where `query` occurs (never across paragraphs), in order.
     pub fn find(&self, query: &str, match_case: bool) -> Vec<Range<usize>> {
+        let mut found = self.find_any(query, match_case);
+        // What was taken out while changes were tracked is no longer part of the text.
+        let gone = |range: &Range<usize>| {
+            let marks = self.formats[range.clone()].iter();
+            marks
+                .map(|format| format.change)
+                .any(|change| change == Change::Deleted)
+        };
+        found.retain(|range| !gone(range));
+        found
+    }
+
+    fn find_any(&self, query: &str, match_case: bool) -> Vec<Range<usize>> {
         let fold = |ch: char| {
             if match_case {
                 ch
@@ -1483,6 +1517,44 @@ fn empty_cell(cell: Cell) -> Block {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn paragraphs_are_sorted_with_their_looks() {
+        let mut doc = Document::default();
+        doc.replace(
+            0..0,
+            "pear
+Apple
+fig
+last",
+            Format::default(),
+        );
+        doc.restyle(0..4, |format| format.bold = true);
+        doc.set_align(2..3, Align::Center);
+        // The first three, from A to Z: capitals do not come first.
+        assert!(doc.sort_paras(0..3, false));
+        assert_eq!(
+            doc.text(),
+            "Apple
+fig
+pear
+last"
+        );
+        assert!(doc.format_at(12).bold && !doc.format_at(1).bold);
+        assert_eq!(doc.paras()[1].align, Align::Center);
+        assert!(doc.sort_paras(0..3, true));
+        assert_eq!(
+            doc.text(),
+            "pear
+fig
+Apple
+last"
+        );
+        // One paragraph is nothing to sort, and a table is left alone.
+        assert!(!doc.sort_paras(0..1, false));
+        doc.insert_table(0, 1, 2).unwrap();
+        assert!(!doc.sort_paras(0..doc.paras().len(), false));
+    }
 
     /// Cells of the document's paragraphs as (row, col), `None` outside tables.
     fn cells(doc: &Document) -> Vec<Option<(u16, u16)>> {

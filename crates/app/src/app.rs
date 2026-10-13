@@ -59,15 +59,27 @@ const RIBBON_TABS_HEIGHT: f32 = 30.0;
 /// Longest document name shown in a tab before "…".
 const TAB_TEXT_MAX: f32 = 180.0;
 /// Highlighter colours (content, like the text colours).
-const HIGHLIGHTS: [([u8; 3], &str); 4] = [
+const HIGHLIGHTS: [([u8; 3], &str); 8] = [
     ([0xFF, 0xF1, 0x76], "Yellow"),
     ([0xB9, 0xF6, 0xCA], "Green"),
     ([0xB3, 0xE5, 0xFC], "Blue"),
     ([0xF8, 0xBB, 0xD0], "Pink"),
+    ([0xFF, 0xD8, 0xA8], "Orange"),
+    ([0xE1, 0xBE, 0xE7], "Purple"),
+    ([0xFF, 0xCD, 0xD2], "Red"),
+    ([0xE0, 0xE0, 0xE0], "Grey"),
 ];
 
 /// Characters offered by Insert > Special character.
-const SYMBOLS: [(&str, &str); 16] = [
+const SYMBOLS: [(&str, &str); 24] = [
+    ("§", "Section"),
+    ("¶", "Paragraph"),
+    ("≤", "Less or equal"),
+    ("≥", "Greater or equal"),
+    ("≠", "Not equal"),
+    ("≈", "About equal"),
+    ("½", "One half"),
+    ("✓", "Check mark"),
     ("—", "Em dash"),
     ("–", "En dash"),
     ("…", "Ellipsis"),
@@ -165,6 +177,10 @@ enum Case {
     Lower,
     /// First letter of each word in capitals.
     Title,
+    /// First letter of each sentence in capitals.
+    Sentence,
+    /// Capitals become small letters and small letters capitals.
+    Toggle,
 }
 
 #[derive(Clone, Copy)]
@@ -257,6 +273,19 @@ enum Cmd {
     Export(Export),
     /// Send the document to a printer.
     Print,
+    /// Put the selected paragraphs in the order of their words (true: from Z to A).
+    Sort(bool),
+    /// Select the next tracked change (false: the one before).
+    NextChange(bool),
+    /// Change the case of the selection to the next of: lower, Title, UPPER.
+    CycleCase,
+    /// Ask which page to go to; fill the screen, or stop.
+    GotoWindow,
+    FullScreen,
+    /// Show or hide the ruler over the page, the options of the program, a dark page.
+    Ruler,
+    Options,
+    DarkPage,
     /// Open the find and replace bar.
     Find,
     CloseFind,
@@ -389,8 +418,21 @@ impl DocTab {
 
     /// Format of the next typed character.
     fn typing(&self) -> Format {
-        self.pending
-            .unwrap_or_else(|| self.doc.format_at(self.selection.start))
+        if let Some(pending) = self.pending {
+            return pending;
+        }
+        let mut format = self.doc.format_at(self.selection.start);
+        // A link, a comment and a tracked change cover their own words: what is typed after
+        // them is plain text again.
+        let next = self.doc.formats().get(self.selection.start);
+        if format.link != 0 && next.is_none_or(|next| next.link != format.link) {
+            (format.link, format.color, format.underline) = (0, [0, 0, 0], false);
+        }
+        if next.is_none_or(|next| next.note != format.note) {
+            format.note = 0;
+        }
+        format.change = Change::None;
+        format
     }
 
     /// Format the toolbar shows: the start of the selection, or the typing format.
@@ -475,6 +517,7 @@ impl DocTab {
                 let lower = |ch: char| ch.to_lowercase().next().unwrap_or(ch);
                 // For title case: the next letter starts a word.
                 let starts_word = std::cell::Cell::new(true);
+                let starts_sentence = std::cell::Cell::new(true);
                 self.doc.map_chars(chars, |ch| match case {
                     Case::Upper => upper(ch),
                     Case::Lower => lower(ch),
@@ -482,6 +525,17 @@ impl DocTab {
                         let first = starts_word.replace(!ch.is_alphanumeric());
                         if first { upper(ch) } else { lower(ch) }
                     }
+                    Case::Sentence => {
+                        let first = starts_sentence.get();
+                        if ch.is_alphanumeric() {
+                            starts_sentence.set(false);
+                        } else if matches!(ch, '.' | '!' | '?' | '\n') {
+                            starts_sentence.set(true);
+                        }
+                        if first { upper(ch) } else { lower(ch) }
+                    }
+                    Case::Toggle if ch.is_uppercase() => lower(ch),
+                    Case::Toggle => upper(ch),
                 });
                 return self.touched();
             }
@@ -759,6 +813,19 @@ pub struct GodApp {
     spell_loading: Option<std::sync::mpsc::Receiver<Result<crate::spell::Speller, String>>>,
     /// The misspelled word the caret is in, and other spellings for it.
     suggested: Option<(Range<usize>, Vec<String>)>,
+    /// The ruler shows over the page; the page shows dark.
+    show_ruler: bool,
+    dark_page: bool,
+    /// The options are shown: who writes the comments, how large the program shows, and
+    /// whether what is typed is put right.
+    options_open: bool,
+    /// Asking which page to go to; the window fills the screen.
+    goto_open: bool,
+    goto_page: usize,
+    fullscreen: bool,
+    author: String,
+    scale: f32,
+    autocorrect: bool,
     /// Only the page is shown, without the tools.
     focus: bool,
     /// Room the pages have in the window, for zooming to fit.
@@ -782,6 +849,9 @@ impl GodApp {
                 zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end())
             });
         theme::install(&cc.egui_ctx, dark);
+        let scale = get("scale").and_then(|scale| scale.parse::<f32>().ok());
+        let scale = scale.unwrap_or(1.0).clamp(0.8, 1.6);
+        cc.egui_ctx.set_zoom_factor(scale);
         let mut fonts = egui::FontDefinitions::default();
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         layout::install_fonts(&mut fonts);
@@ -821,6 +891,15 @@ impl GodApp {
             spell: None,
             spell_loading: None,
             suggested: None,
+            show_ruler: get("ruler").is_none_or(|value| value == "1"),
+            dark_page: get("dark_page").is_some_and(|value| value == "1"),
+            options_open: false,
+            goto_open: false,
+            goto_page: 1,
+            fullscreen: false,
+            author: get("author").unwrap_or_default(),
+            scale,
+            autocorrect: get("autocorrect").is_none_or(|value| value == "1"),
             focus: false,
             view_size: egui::Vec2::ZERO,
             recent: get("recent")
@@ -1171,6 +1250,66 @@ impl GodApp {
             }
             Cmd::Comments => self.show_comments = !self.show_comments,
             Cmd::Track => tab.tracking = !tab.tracking,
+            Cmd::Sort(descending) => {
+                let paras = tab.doc.paras_in(tab.selection.clone());
+                let before = tab.doc.clone();
+                if tab.doc.sort_paras(paras, descending) {
+                    tab.checkpoint(before);
+                    tab.touched();
+                } else {
+                    self.toasts
+                        .error("Select several paragraphs, outside tables, to sort them");
+                }
+            }
+            Cmd::NextChange(forward) => {
+                let formats = tab.doc.formats();
+                let changed = |index: &usize| formats[*index].change != Change::None;
+                let from = tab.selection.clone();
+                // The change after what is selected, or before it; then all of it.
+                let at = if forward {
+                    (from.end..formats.len())
+                        .find(changed)
+                        .or_else(|| (0..from.end).find(changed))
+                } else {
+                    let before = (0..from.start).rev().find(changed);
+                    before.or_else(|| (from.start..formats.len()).rev().find(changed))
+                };
+                match at {
+                    Some(at) => {
+                        let same = |index: &usize| formats[*index].change == formats[at].change;
+                        let start = at - (0..at).rev().take_while(same).count();
+                        let end = at + (at..formats.len()).take_while(same).count();
+                        tab.selection = start..end;
+                        tab.view.scroll_to = Some(start);
+                        set_cursor(ctx, editor_id, &tab.selection);
+                    }
+                    None => self.toasts.success("No tracked change in this document"),
+                }
+            }
+            Cmd::CycleCase => {
+                let letters = tab.doc.text().chars().skip(tab.selection.start);
+                let chosen: String = letters.take(tab.selection.len()).collect();
+                // From small letters to a capital on each word, then to capitals, and back.
+                let next = if chosen == chosen.to_lowercase() {
+                    Case::Title
+                } else if chosen == chosen.to_uppercase() {
+                    Case::Lower
+                } else {
+                    Case::Upper
+                };
+                tab.apply(Edit::Case(next));
+            }
+            Cmd::GotoWindow => {
+                self.goto_open = true;
+                return;
+            }
+            Cmd::FullScreen => {
+                self.fullscreen = !self.fullscreen;
+                ctx.send_viewport_cmd(ViewportCommand::Fullscreen(self.fullscreen));
+            }
+            Cmd::Ruler => self.show_ruler = !self.show_ruler,
+            Cmd::Options => self.options_open = !self.options_open,
+            Cmd::DarkPage => self.dark_page = !self.dark_page,
             Cmd::Spelling => {
                 self.spelling = !self.spelling;
                 if self.spelling {
@@ -1382,6 +1521,20 @@ impl GodApp {
         let table = [
             (shift, Key::S, Cmd::SaveAs),
             (shift, Key::Z, Cmd::Redo),
+            (Modifiers::SHIFT, Key::F3, Cmd::CycleCase),
+            (Modifiers::NONE, Key::F11, Cmd::FullScreen),
+            (ctrl, Key::G, Cmd::GotoWindow),
+            (shift, Key::L, Cmd::Edit(Edit::List(List::Bullet))),
+            (shift, Key::M, Cmd::Edit(Edit::Indent(-1))),
+            (shift, Key::E, Cmd::Track),
+            (shift, Key::C, Cmd::FormatPainter),
+            (alt, Key::M, Cmd::CommentWindow),
+            (ctrl, Key::M, Cmd::Edit(Edit::Indent(1))),
+            (ctrl, Key::Num0, Cmd::Zoom(1.0)),
+            (ctrl, Key::Equals, Cmd::Zoom(self.zoom + 0.1)),
+            (ctrl, Key::Minus, Cmd::Zoom(self.zoom - 0.1)),
+            (Modifiers::NONE, Key::F7, Cmd::Spelling),
+            (Modifiers::NONE, Key::F12, Cmd::SaveAs),
             (shift, Key::N, kind(Kind::Normal)),
             (alt, Key::Num1, kind(Kind::Heading1)),
             (alt, Key::Num2, kind(Kind::Heading2)),
@@ -1661,6 +1814,8 @@ impl GodApp {
                             ("UPPERCASE", Case::Upper),
                             ("lowercase", Case::Lower),
                             ("Title Case", Case::Title),
+                            ("Sentence case.", Case::Sentence),
+                            ("tOGGLE cASE", Case::Toggle),
                         ];
                         for (label, case) in cases {
                             if ui.button(label).clicked() {
@@ -1763,6 +1918,16 @@ impl GodApp {
                     if widgets::icon_button(ui, icon::TEXT_INDENT, "Increase indent").clicked() {
                         clicked.push(edit(Edit::Indent(1)));
                     }
+                    let sort =
+                        widgets::icon_button(ui, icon::SORT_ASCENDING, "Sort the paragraphs");
+                    Popup::menu(&sort).show(|ui| {
+                        if ui.button("A to Z").clicked() {
+                            clicked.push(Cmd::Sort(false));
+                        }
+                        if ui.button("Z to A").clicked() {
+                            clicked.push(Cmd::Sort(true));
+                        }
+                    });
                     let marks = "Show the spaces and the ends of paragraphs";
                     if widgets::toggle_button(ui, icon::PARAGRAPH, marks, self.show_marks).clicked()
                     {
@@ -1792,6 +1957,28 @@ impl GodApp {
                         ui.separator();
                         if ui.button("Line spacing options…").clicked() {
                             clicked.push(Cmd::ParagraphWindow);
+                        }
+                        // A space above or under the paragraph, put or taken away in one go.
+                        let rooms = [
+                            (
+                                "before",
+                                para.before,
+                                Edit::Before(if para.before > 0 { 0 } else { 240 }),
+                            ),
+                            (
+                                "after",
+                                para.after,
+                                Edit::After(if para.after > 0 { 0 } else { 160 }),
+                            ),
+                        ];
+                        for (side, now, change) in rooms {
+                            let verb = if now > 0 { "Remove" } else { "Add" };
+                            if ui
+                                .button(format!("{verb} space {side} paragraph"))
+                                .clicked()
+                            {
+                                clicked.push(edit(change));
+                            }
                         }
                     });
                     let rule = "A line under the paragraph";
@@ -1840,29 +2027,59 @@ impl GodApp {
         let palette = Palette::of(ui);
         let tab = &self.tabs[self.active];
         ui.horizontal(|ui| {
-            let pages = if tab.pages == 1 { "page" } else { "pages" };
+            // The page the caret is on, among those of the document.
+            let para = tab.doc.para_at(tab.selection.start);
+            let page = tab.para_pages.get(para).map_or(1, |page| page + 1);
+            let words = tab.doc.word_count();
+            // With words selected: how many of them.
+            let chosen: String = {
+                let letters = tab.doc.text().chars().skip(tab.selection.start);
+                letters.take(tab.selection.len()).collect()
+            };
+            let words = match chosen.split_whitespace().count() {
+                0 => format!("{words} words"),
+                chosen => format!("{chosen} of {words} words"),
+            };
             let counts = format!(
-                "{} {pages} · {} words · {} characters",
-                tab.pages,
-                tab.doc.word_count(),
+                "Page {page} of {} · {words} · {} characters",
+                tab.pages.max(page),
                 tab.doc.len()
             );
-            ui.label(RichText::new(counts).size(13.0).color(palette.text_dim));
+            let counts = RichText::new(counts).size(13.0).color(palette.text_dim);
+            let label = egui::Label::new(counts)
+                .selectable(false)
+                .sense(Sense::click());
+            if ui.add(label).on_hover_text("Word count").clicked() {
+                clicked.push(Cmd::WordCount);
+            }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
                 ui.spacing_mut().item_spacing.x = 2.0;
+                let percent = RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(13.0);
+                let label = egui::Label::new(percent)
+                    .selectable(false)
+                    .sense(Sense::click());
+                if ui
+                    .add_sized(vec2(44.0, 22.0), label)
+                    .on_hover_text("Back to 100%")
+                    .clicked()
+                {
+                    clicked.push(Cmd::Zoom(1.0));
+                }
                 if widgets::small_icon_button(ui, icon::PLUS, "Zoom in").clicked() {
                     clicked.push(Cmd::Zoom(self.zoom + 0.1));
                 }
-                let zoom = RichText::new(format!("{:.0}%", self.zoom * 100.0)).size(13.0);
-                ui.add_sized(vec2(44.0, 22.0), egui::Label::new(zoom).selectable(false));
+                let mut zoom = self.zoom;
+                ui.spacing_mut().slider_width = 110.0;
+                let slider = egui::Slider::new(&mut zoom, ZOOM_RANGE).show_value(false);
+                if ui.add(slider).changed() {
+                    clicked.push(Cmd::Zoom(zoom));
+                }
                 if widgets::small_icon_button(ui, icon::MINUS, "Zoom out").clicked() {
                     clicked.push(Cmd::Zoom(self.zoom - 0.1));
                 }
             });
         });
     }
-
-    // ------------------------------------------------------------ page
 
     // ------------------------------------------------------------ home screen
 
@@ -2001,6 +2218,10 @@ impl GodApp {
                     tools(ui, p, "Window", |ui| {
                         tool(ui, p, clicked, icon::X, "Close", false, Cmd::CloseTab);
                         tool(ui, p, clicked, icon::SIGN_OUT, "Quit", false, Cmd::Quit);
+                    });
+                    tools(ui, p, "Program", |ui| {
+                        let open = self.options_open;
+                        tool(ui, p, clicked, icon::GEAR, "Options", open, Cmd::Options);
                     });
                 }
                 Ribbon::Insert => {
@@ -2345,10 +2566,26 @@ impl GodApp {
                             Cmd::Changes(false),
                         );
                     });
+                    tools(ui, p, "Changes", |ui| {
+                        let back = icon::ARROW_UP;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            back,
+                            "Previous",
+                            false,
+                            Cmd::NextChange(false),
+                        );
+                        let on = icon::ARROW_DOWN;
+                        tool(ui, p, clicked, on, "Next", false, Cmd::NextChange(true));
+                    });
                     tools(ui, p, "Find", |ui| {
                         let find = icon::MAGNIFYING_GLASS;
                         tool(ui, p, clicked, find, "Find", self.find.open, Cmd::Find);
                         tool(ui, p, clicked, icon::SWAP, "Replace", false, Cmd::Find);
+                        let go = icon::ARROW_BEND_DOWN_RIGHT;
+                        tool(ui, p, clicked, go, "Go to", self.goto_open, Cmd::GotoWindow);
                     });
                     tools(ui, p, "Formatting", |ui| {
                         let marks = self.show_marks;
@@ -2404,6 +2641,16 @@ impl GodApp {
                 }
                 Ribbon::View => {
                     tools(ui, p, "Views", |ui| {
+                        let full = icon::ARROWS_OUT;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            full,
+                            "Full screen",
+                            self.fullscreen,
+                            Cmd::FullScreen,
+                        );
                         tool(
                             ui,
                             p,
@@ -2427,6 +2674,8 @@ impl GodApp {
                         );
                         let marks = self.show_marks;
                         tool(ui, p, clicked, icon::PARAGRAPH, "Marks", marks, Cmd::Marks);
+                        let ruler = self.show_ruler;
+                        tool(ui, p, clicked, icon::RULER, "Ruler", ruler, Cmd::Ruler);
                     });
                     tools(ui, p, "Zoom", |ui| {
                         let out = icon::MAGNIFYING_GLASS_MINUS;
@@ -2470,6 +2719,8 @@ impl GodApp {
                             (icon::MOON, "Dark mode")
                         };
                         tool(ui, p, clicked, glyph, label, false, Cmd::ToggleTheme);
+                        let dark = self.dark_page;
+                        tool(ui, p, clicked, icon::FILE, "Dark page", dark, Cmd::DarkPage);
                     });
                 }
             }
@@ -2616,9 +2867,13 @@ impl GodApp {
         }
         let tab = &mut self.tabs[self.active];
         tab.checkpoint(tab.doc.clone());
-        let author = std::env::var("USERNAME").or_else(|_| std::env::var("USER"));
+        // The name given in the options, or else the one of the session.
+        let named = Some(self.author.trim().to_owned()).filter(|name| !name.is_empty());
+        let author = named
+            .or_else(|| std::env::var("USERNAME").ok())
+            .or_else(|| std::env::var("USER").ok());
         let note = tab.doc.add_comment(Comment {
-            author: author.unwrap_or_else(|_| "Me".to_owned()),
+            author: author.unwrap_or_else(|| "Me".to_owned()),
             text: said,
         });
         tab.doc
@@ -2972,6 +3227,190 @@ impl GodApp {
         }
     }
 
+    /// The ruler over the page: its margins, in centimetres from the left one, and the
+    /// indents of the paragraph the caret is in, to drag.
+    fn ruler(&self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
+        let palette = Palette::of(ui);
+        let tab = &self.tabs[self.active];
+        let (para, page, zoom) = (tab.para(), tab.doc.page, self.zoom);
+        let size = vec2(ui.available_width(), RULER_HEIGHT);
+        let (strip, _) = ui.allocate_exact_size(size, Sense::hover());
+        let sheet = layout::page_size(page, zoom);
+        let [_, right_margin, _, left_margin] = layout::margins(page, zoom);
+        let painter = ui.painter_at(strip);
+        painter.rect_filled(strip, 0.0, palette.bg);
+        // The sheet, darker where its margins are.
+        let left = strip.center().x - sheet.x / 2.0;
+        let paper = Rect::from_min_max(
+            pos2(left, strip.top() + 3.0),
+            pos2(left + sheet.x, strip.bottom() - 3.0),
+        );
+        painter.rect_filled(paper, CornerRadius::same(2), palette.border);
+        let text = Rect::from_min_max(
+            pos2(paper.left() + left_margin, paper.top()),
+            pos2(paper.right() - right_margin, paper.bottom()),
+        );
+        painter.rect_filled(text, 0.0, palette.surface);
+        // A mark each quarter of a centimetre, a number each centimetre.
+        let quarter = TWIPS_PER_CM / goddoc_core::TWIPS_PER_POINT * zoom / 4.0;
+        let middle = strip.center().y;
+        let mut mark = -((text.left() - paper.left()) / quarter).floor() as i32;
+        loop {
+            let x = text.left() + mark as f32 * quarter;
+            if x > paper.right() {
+                break;
+            }
+            if mark % 4 != 0 {
+                let half = if mark % 2 == 0 { 3.0 } else { 1.5 };
+                let stroke = Stroke::new(1.0, palette.text_dim);
+                painter.vline(x, middle - half..=middle + half, stroke);
+            } else if mark != 0 {
+                let number = (mark / 4).abs().to_string();
+                let font = FontId::proportional(9.5);
+                painter.text(
+                    pos2(x, middle),
+                    Align2::CENTER_CENTER,
+                    number,
+                    font,
+                    palette.text_dim,
+                );
+            }
+            mark += 1;
+        }
+        // In a table, indents are counted from the cell: the ruler does not show them.
+        if para.cell.is_some() {
+            return;
+        }
+        // Screen points per twentieth of a point, and the step indents snap to.
+        let twip = zoom / goddoc_core::TWIPS_PER_POINT;
+        let step = TWIPS_PER_CM / 4.0;
+        let snapped = |length: f32| ((length / twip / step).round() * step).clamp(0.0, 11000.0);
+        let hanging = f32::from(para.first_line.min(0).unsigned_abs()) * twip;
+        let start = text.left() + layout::level_room(&para, zoom) + f32::from(para.left) * twip;
+        let first = start + f32::from(para.first_line.max(0)) * twip;
+        let end = text.right() - f32::from(para.right) * twip;
+        let level = start - f32::from(para.left) * twip;
+        let markers: [Marker<'_>; 3] = [
+            ("First line indent", first, true, &|x| {
+                Edit::FirstLine(snapped(x - start) as i16)
+            }),
+            ("Left indent", start + hanging, false, &|x| {
+                Edit::Left(snapped(x - hanging - level) as u16)
+            }),
+            ("Right indent", end, false, &|x| {
+                Edit::Right(snapped(text.right() - x) as u16)
+            }),
+        ];
+        for (name, at, top, moved) in markers {
+            let y = if top {
+                strip.top() + 6.0
+            } else {
+                strip.bottom() - 6.0
+            };
+            let hit = Rect::from_center_size(pos2(at, y), vec2(12.0, 11.0));
+            let response = ui
+                .interact(hit, ui.id().with(("ruler", name)), Sense::drag())
+                .on_hover_text(name)
+                .on_hover_cursor(egui::CursorIcon::ResizeHorizontal);
+            let id = response.id;
+            // While it is dragged, the marker follows the pointer; the paragraph moves once it
+            // is let go, in one step.
+            let mut shown = at;
+            if let Some(pointer) = response
+                .interact_pointer_pos()
+                .filter(|_| response.dragged())
+            {
+                shown = pointer.x.clamp(paper.left(), paper.right());
+                ui.data_mut(|data| data.insert_temp(id, shown));
+                let line = Stroke::new(1.0, palette.text_dim);
+                ui.ctx().layer_painter(ui.layer_id()).vline(
+                    shown,
+                    strip.bottom()..=ui.clip_rect().bottom(),
+                    line,
+                );
+            } else if let Some(dropped) = ui.data_mut(|data| data.remove_temp::<f32>(id)) {
+                clicked.push(Cmd::Edit(moved(dropped)));
+            }
+            let tip = if top { 4.0 } else { -4.0 };
+            let shape = vec![
+                pos2(shown - 5.0, y - tip),
+                pos2(shown + 5.0, y - tip),
+                pos2(shown, y + tip),
+            ];
+            painter.add(egui::Shape::convex_polygon(
+                shape,
+                palette.text,
+                Stroke::NONE,
+            ));
+        }
+    }
+
+    /// What the program is told once and for all: who writes, how large it shows, and
+    /// whether it puts right what is typed.
+    fn options_window(&mut self, ctx: &Context) {
+        if !self.options_open {
+            return;
+        }
+        let (author, autocorrect) = (&mut self.author, &mut self.autocorrect);
+        let mut scale = None;
+        let now = self.scale;
+        self.options_open = dialog(ctx, "Options", |ui| {
+            let grid = egui::Grid::new("options").num_columns(2);
+            grid.spacing(vec2(28.0, 9.0)).show(ui, |ui| {
+                ui.label("Your name");
+                let field = TextEdit::singleline(author)
+                    .hint_text("On your comments")
+                    .desired_width(200.0)
+                    .margin(widgets::FIELD_MARGIN);
+                ui.add(field);
+                ui.end_row();
+                ui.label("Interface size");
+                scale = number(ui, "scale", now * 100.0, 80.0..=160.0, 1.0, " %");
+                ui.end_row();
+                ui.label("AutoCorrect");
+                ui.checkbox(autocorrect, "Quotes, dashes and signs as you type");
+                ui.end_row();
+            });
+        });
+        if let Some(scale) = scale {
+            self.scale = (scale / 100.0).clamp(0.8, 1.6);
+            ctx.set_zoom_factor(self.scale);
+        }
+    }
+
+    /// Which page to go to.
+    fn goto_window(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        if !self.goto_open || self.home {
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let pages = tab.pages.max(1);
+        let page = &mut self.goto_page;
+        *page = (*page).clamp(1, pages);
+        let mut go = false;
+        self.goto_open = dialog(ctx, "Go to page", |ui| {
+            ui.horizontal(|ui| {
+                ui.label("Page");
+                let field = egui::DragValue::new(page).range(1..=pages).speed(0.1);
+                let typed = ui.add_sized(vec2(70.0, 24.0), field);
+                ui.label(format!("of {pages}"));
+                go = typed.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            });
+            ui.add_space(8.0);
+            go |= ui.button("Go").clicked();
+        });
+        if !go {
+            return;
+        }
+        // The first paragraph that starts on the page, or after it.
+        let wanted = self.goto_page - 1;
+        let para = tab.para_pages.iter().position(|page| *page >= wanted);
+        let lines = tab.doc.text().split('\n').take(para.unwrap_or(0));
+        let at = lines.map(|line| line.chars().count() + 1).sum();
+        clicked.push(Cmd::Goto(at));
+        self.goto_open = false;
+    }
+
     /// Words, characters and paragraphs of the document in front, in a small window.
     fn word_count(&mut self, ctx: &Context) {
         if !self.counting || self.home {
@@ -3129,6 +3568,10 @@ impl GodApp {
 
     fn page(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
         self.view_size = ui.available_size();
+        layout::set_dark_page(self.dark_page);
+        if self.show_ruler && !self.focus {
+            self.ruler(ui, clicked);
+        }
         let zoom_delta = ui.input(|input| input.zoom_delta());
         if zoom_delta != 1.0 && ui.rect_contains_pointer(ui.max_rect()) {
             self.zoom = (self.zoom * zoom_delta).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
@@ -3216,6 +3659,19 @@ impl GodApp {
             ui.ctx().request_repaint();
         }
         let mut selection = out.selection;
+        // AutoCorrect: what one typed letter completes is put right.
+        if self.autocorrect
+            && !out.structural
+            && let Some(before) = &out.before
+            && tab.doc.len() == before.len() + 1
+            && let Some(caret) = selection.as_ref().filter(|range| range.is_empty())
+        {
+            let french = self.language == crate::spell::Language::French;
+            if let Some(caret) = autocorrect(&mut tab.doc, caret.start, french) {
+                selection = Some(caret..caret);
+                set_cursor(ui.ctx(), tab.editor_id(), &(caret..caret));
+            }
+        }
         if let Some(before) = &out.before
             && tab.tracking
             && !out.structural
@@ -3426,6 +3882,8 @@ impl eframe::App for GodApp {
 
         self.finish_output();
         self.finish_spelling();
+        self.options_window(&ctx);
+        self.goto_window(&ctx, &mut clicked);
         self.banner_window(&ctx);
         self.link_window(&ctx);
         self.comment_window(&ctx);
@@ -3453,6 +3911,12 @@ impl eframe::App for GodApp {
             .map(|path| path.display().to_string())
             .collect();
         storage.set_string("recent", recent.join("\n"));
+        let flag = |on: bool| if on { "1" } else { "0" }.to_owned();
+        storage.set_string("ruler", flag(self.show_ruler));
+        storage.set_string("dark_page", flag(self.dark_page));
+        storage.set_string("autocorrect", flag(self.autocorrect));
+        storage.set_string("author", self.author.clone());
+        storage.set_string("scale", self.scale.to_string());
     }
 }
 
@@ -3832,6 +4296,51 @@ fn track(before: &Document, doc: &mut Document, caret: usize, after: usize) -> O
     })
 }
 
+/// Height of the ruler over the page.
+const RULER_HEIGHT: f32 = 22.0;
+/// A marker of the ruler: its name, where it stands, whether it hangs from the top, and the
+/// change it makes when dropped at a place.
+type Marker<'a> = (&'a str, f32, bool, &'a dyn Fn(f32) -> Edit);
+
+/// Put right what the letter just typed before `caret` completes: quotes that open and
+/// close, a dash for two hyphens, the sign for "(c)". Gives where the caret goes then.
+fn autocorrect(doc: &mut Document, caret: usize, french: bool) -> Option<usize> {
+    let from = caret.saturating_sub(5);
+    let tail: Vec<char> = doc.text().chars().skip(from).take(caret - from).collect();
+    let typed = *tail.last()?;
+    let ends = |with: &str| tail.ends_with(&with.chars().collect::<Vec<char>>());
+    // A quote opens at the start of a line, after a space or an opening sign.
+    let before = tail.len().checked_sub(2).map(|at| tail[at]);
+    let opens = before.is_none_or(|ch| ch.is_whitespace() || "([{\u{2014}\u{ab}".contains(ch));
+    // A fraction stands alone: "11/2" is not eleven halves.
+    let alone = |letters: usize| {
+        let ahead = tail.len().checked_sub(letters + 1).map(|at| tail[at]);
+        ahead.is_none_or(|ch| !ch.is_ascii_digit())
+    };
+    let (taken, put) = match typed {
+        '"' if french && opens => (1, "\u{ab}\u{a0}"),
+        '"' if french => (1, "\u{a0}\u{bb}"),
+        '"' if opens => (1, "\u{201c}"),
+        '"' => (1, "\u{201d}"),
+        '\'' if opens => (1, "\u{2018}"),
+        '\'' => (1, "\u{2019}"),
+        '-' if ends("--") => (2, "\u{2014}"),
+        '-' if ends("<-") => (2, "\u{2190}"),
+        '>' if ends("->") => (2, "\u{2192}"),
+        '.' if ends("...") => (3, "\u{2026}"),
+        ')' if ends("(c)") => (3, "\u{a9}"),
+        ')' if ends("(r)") => (3, "\u{ae}"),
+        ')' if ends("(tm)") => (4, "\u{2122}"),
+        '2' if ends("1/2") && alone(3) => (3, "\u{bd}"),
+        '4' if ends("1/4") && alone(3) => (3, "\u{bc}"),
+        '4' if ends("3/4") && alone(3) => (3, "\u{be}"),
+        _ => return None,
+    };
+    let format = doc.formats().get(caret - 1).copied()?;
+    doc.replace(caret - taken..caret, put, format);
+    Some(caret - taken + put.chars().count())
+}
+
 /// A named group of large ribbon buttons, side by side.
 fn tools(ui: &mut Ui, palette: &Palette, name: &str, buttons: impl FnOnce(&mut Ui)) {
     group(ui, palette, name, |ui| {
@@ -3933,7 +4442,7 @@ fn color_tool(
 
 /// A paragraph style to pick: a few letters as it writes them, on paper, over its name.
 fn style_card(ui: &mut Ui, palette: &Palette, kind: Kind, on: bool) -> Response {
-    let (rect, response) = ui.allocate_exact_size(vec2(78.0, GROUP_TOOLS), Sense::click());
+    let (rect, response) = ui.allocate_exact_size(vec2(73.0, GROUP_TOOLS), Sense::click());
     let painter = ui.painter().with_clip_rect(rect);
     let edge = if on {
         Stroke::new(1.5, palette.text)
@@ -4287,6 +4796,28 @@ mod tests {
 #[cfg(test)]
 mod tracking {
     use super::*;
+
+    #[test]
+    fn what_is_typed_is_put_right() {
+        let typed = |text: &str, french: bool| {
+            let mut doc = Document::default();
+            doc.replace(0..0, text, Format::default());
+            let caret = autocorrect(&mut doc, text.chars().count(), french);
+            (doc.text().to_owned(), caret)
+        };
+        assert_eq!(typed("say \"", false), ("say \u{201c}".to_owned(), Some(5)));
+        assert_eq!(typed("say \u{201c}hi\"", false).0, "say \u{201c}hi\u{201d}");
+        assert_eq!(typed("dit \"", true).0, "dit \u{ab}\u{a0}");
+        assert_eq!(typed("don'", false).0, "don\u{2019}");
+        assert_eq!(typed("wait--", false), ("wait\u{2014}".to_owned(), Some(5)));
+        assert_eq!(typed("and so...", false).0, "and so\u{2026}");
+        assert_eq!(typed("(c)", false).0, "\u{a9}");
+        assert_eq!(typed("a ->", false).0, "a \u{2192}");
+        assert_eq!(typed("1/2", false).0, "\u{bd}");
+        // Eleven halves stay as typed, and so does an ordinary letter.
+        assert_eq!(typed("11/2", false), ("11/2".to_owned(), None));
+        assert_eq!(typed("abc", false).1, None);
+    }
 
     #[test]
     fn what_is_typed_and_taken_out_is_marked() {

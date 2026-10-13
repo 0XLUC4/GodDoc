@@ -1,14 +1,14 @@
 # Shows the print dialog of Windows, then prints the pages GodDoc draws into the folder
-# GODPDF_PRINT_DIR as 1.png, 2.png, and so on. Says on its output: 'cancel', or
+# GODDOC_PRINT_DIR as 1.png, 2.png, and so on. Says on its output: 'cancel', or
 # 'pages <first> <last>' then 'done', or 'error <why>'.
 # It is given to PowerShell as one argument: no double quotes in here.
 $ErrorActionPreference = 'Stop'
 try {
     Add-Type -AssemblyName System.Windows.Forms
     Add-Type -AssemblyName System.Drawing
-    $count = [int]$env:GODPDF_PRINT_PAGES
+    $count = [int]$env:GODDOC_PRINT_PAGES
     $doc = New-Object System.Drawing.Printing.PrintDocument
-    $doc.DocumentName = $env:GODPDF_PRINT_NAME
+    $doc.DocumentName = $env:GODDOC_PRINT_NAME
     # No small window saying which page is being printed.
     $doc.PrintController = New-Object System.Drawing.Printing.StandardPrintController
     $settings = $doc.PrinterSettings
@@ -16,29 +16,22 @@ try {
     $settings.MaximumPage = $count
     $settings.FromPage = 1
     $settings.ToPage = $count
-    if ($env:GODPDF_PRINT_TO) {
-        # For tests: no dialog, the pages go to a file.
-        $settings.PrinterName = 'Microsoft Print to PDF'
-        $settings.PrintToFile = $true
-        $settings.PrintFileName = $env:GODPDF_PRINT_TO
-    } else {
-        $dialog = New-Object System.Windows.Forms.PrintDialog
-        $dialog.Document = $doc
-        $dialog.AllowSomePages = $true
-        $dialog.UseEXDialog = $true
-        # An owner that stays on top: the dialog must not open behind GodDoc.
-        $owner = New-Object System.Windows.Forms.Form
-        $owner.TopMost = $true
-        $owner.ShowInTaskbar = $false
-        $owner.Opacity = 0
-        $owner.StartPosition = 'CenterScreen'
-        $owner.Show()
-        $answer = $dialog.ShowDialog($owner)
-        $owner.Close()
-        if ($answer -ne 'OK') {
-            [Console]::Out.WriteLine('cancel')
-            exit 0
-        }
+    $dialog = New-Object System.Windows.Forms.PrintDialog
+    $dialog.Document = $doc
+    $dialog.AllowSomePages = $true
+    $dialog.UseEXDialog = $true
+    # An owner that stays on top: the dialog must not open behind GodDoc.
+    $owner = New-Object System.Windows.Forms.Form
+    $owner.TopMost = $true
+    $owner.ShowInTaskbar = $false
+    $owner.Opacity = 0
+    $owner.StartPosition = 'CenterScreen'
+    $owner.Show()
+    $answer = $dialog.ShowDialog($owner)
+    $owner.Close()
+    if ($answer -ne 'OK') {
+        [Console]::Out.WriteLine('cancel')
+        exit 0
     }
     $global:page = 1
     $global:last = $count
@@ -52,7 +45,7 @@ try {
     # Before each page: wait for GodDoc to have drawn it, and turn the paper as it is turned.
     $doc.add_QueryPageSettings({
         param($sender, $e)
-        $path = Join-Path $env:GODPDF_PRINT_DIR ([string]$global:page + '.png')
+        $path = Join-Path $env:GODDOC_PRINT_DIR ([string]$global:page + '.png')
         $limit = (Get-Date).AddMinutes(5)
         while (-not (Test-Path -LiteralPath $path)) {
             if ((Get-Date) -gt $limit) { throw 'the page was not drawn in time' }

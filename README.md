@@ -33,6 +33,11 @@ New versions come through the Updates button: it downloads one and restarts on i
 - Text in two or three columns, table cells joined across columns, pictures with the text beside them.
 - Spelling in English and French, checked on this computer: wrong words are underlined, a right click offers others. The dictionary of a language is fetched once, when it is first asked for.
 - Exported PDFs carry their text: it can be selected, copied and searched.
+- AutoCorrect as you type: quotes that open and close (guillemets in French), a dash for two hyphens, the signs for (c), -> and 1/2.
+- A ruler over the page, in centimetres, with the indents of the paragraph to drag.
+- A dark page for the eyes, which changes nothing in the document; options for your name on comments and the size of the interface.
+- Paragraphs sorted from A to Z, five ways to change case (Shift+F3 goes through three), the next and the previous tracked change, Go to page (Ctrl+G), full screen (F11).
+- A status bar that says the page the caret is on, counts the selected words and zooms with a slider.
 
 Not there yet: cells joined across rows, columns that differ within a document, text that runs around a picture below its own paragraph, grammar.
 

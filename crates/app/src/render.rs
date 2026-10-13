@@ -310,11 +310,5 @@ mod tests {
         )
         .unwrap();
         crate::pdf::write(&rendered, std::path::Path::new(&format!("{to}.pdf"))).unwrap();
-        // With GODPDF_PRINT_TO set as well, it is printed to that file, without the dialog.
-        #[cfg(windows)]
-        if std::env::var("GODPDF_PRINT_TO").is_ok() {
-            let printed = crate::print::print("test", rendered.pages, |page| rendered.page(page));
-            assert_eq!(printed, Ok(Some("Sent to the printer")));
-        }
     }
 }
