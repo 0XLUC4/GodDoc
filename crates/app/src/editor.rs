@@ -19,7 +19,7 @@ use crate::layout::{self, PageLayout, PictureBox};
 use crate::widgets::icon;
 
 /// Space around the pages on the canvas.
-const PAD: f32 = 28.0;
+pub const PAD: f32 = 28.0;
 const TABLE_BORDER: Color32 = Color32::from_gray(0x33);
 /// How far left of the text the block grip sits, and how wide the zone that shows it is.
 const GRIP_OFFSET: f32 = 26.0;
@@ -77,8 +77,22 @@ pub struct View {
     menu_at: Option<egui::Pos2>,
     /// Show what stands for spaces, tabs and the ends of paragraphs.
     pub marks: bool,
+    /// Only the sheets and what is written on them: for printing, not for the screen.
+    plain: bool,
+    /// Words the dictionary does not know, in characters and in order: they are underlined.
+    pub misspelled: Vec<Range<usize>>,
     /// Where the caret is, and since when: its blink starts over when it moves.
     caret: (usize, f64),
+}
+
+impl View {
+    /// A view that shows only the sheets and what is written on them, to print them.
+    pub fn plain() -> Self {
+        Self {
+            plain: true,
+            ..Self::default()
+        }
+    }
 }
 
 pub struct Output {
@@ -122,6 +136,7 @@ fn paint_pages(
     origin: Vec2,
     zoom: f32,
     doc: &Document,
+    plain: bool,
 ) {
     let painter = ui.painter();
     let shadow = Shadow {
@@ -132,22 +147,43 @@ fn paint_pages(
     };
     let number_font = layout::text_format(&Format::default(), zoom, 1.0).font_id;
     let step = layout::page_step(doc.page, zoom);
-    let margin = layout::margin(doc.page, zoom);
+    let [top, right, bottom, left] = layout::margins(doc.page, zoom);
+    let (header, footer) = (&doc.header, doc.shown_footer());
     for page in 0..pages.pages {
         let sheet = first_page.translate(vec2(0.0, page as f32 * step));
         if !ui.is_rect_visible(sheet.expand(24.0)) {
             continue;
         }
-        painter.add(shadow.as_shape(sheet, CornerRadius::same(2)));
-        painter.rect_filled(sheet, CornerRadius::same(2), Color32::WHITE);
-        if doc.page_numbers {
-            painter.text(
-                sheet.center_bottom() - vec2(0.0, margin / 2.0),
-                egui::Align2::CENTER_CENTER,
-                (page + 1).to_string(),
-                number_font.clone(),
-                Color32::from_gray(0x44),
-            );
+        // To print, a page is only its sheet, square to its corners.
+        let corners = if plain { 0 } else { 2 };
+        if !plain {
+            painter.add(shadow.as_shape(sheet, CornerRadius::same(corners)));
+        }
+        painter.rect_filled(sheet, CornerRadius::same(corners), Color32::WHITE);
+        // The header in the middle of the top margin, the footer in that of the bottom one;
+        // each at the left, in the middle and at the right of the text area.
+        let (from, to) = (sheet.left() + left, sheet.right() - right);
+        let banners = [
+            (header, sheet.top() + top / 2.0),
+            (&footer, sheet.bottom() - bottom / 2.0),
+        ];
+        for (banner, y) in banners {
+            let zones = [
+                (&banner.left, from, egui::Align2::LEFT_CENTER),
+                (
+                    &banner.center,
+                    (from + to) / 2.0,
+                    egui::Align2::CENTER_CENTER,
+                ),
+                (&banner.right, to, egui::Align2::RIGHT_CENTER),
+            ];
+            for (zone, x, anchor) in zones {
+                if !zone.trim().is_empty() {
+                    let said = goddoc_core::Banner::on_page(zone, page + 1, pages.pages);
+                    let ink = Color32::from_gray(0x44);
+                    painter.text(pos2(x, y), anchor, said, number_font.clone(), ink);
+                }
+            }
         }
     }
     for cell in &pages.cells {
@@ -255,7 +291,8 @@ fn paint_found(ui: &Ui, pages: &PageLayout, origin: Vec2, found: &Range<usize>) 
 
 /// Clicks and drags in table cells: put the caret where the pointer is.
 fn cell_pointer(ui: &Ui, id: Id, pages: &PageLayout, origin: Vec2) {
-    for (index, cell) in pages.cells.iter().enumerate() {
+    // The columns first: a table cell in one of them is over it, and takes the click.
+    for (index, cell) in pages.strips.iter().chain(&pages.cells).enumerate() {
         let rect = cell.rect.translate(origin);
         if !ui.is_rect_visible(rect) {
             continue;
@@ -574,6 +611,23 @@ fn paint_underlines(ui: &Ui, galley: &egui::Galley, at: egui::Pos2, doc: &Docume
     }
 }
 
+/// A red wave under the words of `galley` (shown at `at`) the dictionary does not know.
+fn paint_misspelled(ui: &Ui, galley: &egui::Galley, at: egui::Pos2, words: &[Range<usize>]) {
+    if words.is_empty() {
+        return;
+    }
+    let visible = ui.clip_rect().translate(-at.to_vec2());
+    let stroke = Stroke::new(1.0, Color32::from_rgb(0xE0, 0x2B, 0x2B));
+    for (left, length) in layout::marked_words(galley, words, visible) {
+        let steps = (length / 2.0).ceil() as usize;
+        let wave = (0..=steps).map(|step| {
+            let down = if step % 2 == 0 { 0.0 } else { 2.0 };
+            left + at.to_vec2() + vec2((step as f32 * 2.0).min(length), down)
+        });
+        ui.painter().add(egui::Shape::line(wave.collect(), stroke));
+    }
+}
+
 /// Byte at which character `index` of `text` starts.
 fn byte_of(text: &str, index: usize) -> usize {
     let mut bytes = text.char_indices().map(|(byte, _)| byte);
@@ -643,6 +697,40 @@ fn edited(
 }
 
 /// Show `doc` on its pages and let the user edit it. New text is typed in `typing`.
+/// Points scrolled by one notch of the wheel.
+const WHEEL_LINE: f32 = 100.0;
+
+/// How far the wheel asks the pages to move this frame. Ctrl+wheel zooms: it is not counted.
+fn wheel_delta(ui: &Ui) -> Vec2 {
+    let page = ui.clip_rect().height();
+    ui.input(|input| {
+        input
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                egui::Event::MouseWheel {
+                    unit,
+                    delta,
+                    modifiers,
+                    ..
+                } if !modifiers.command && !modifiers.ctrl => {
+                    let delta = match unit {
+                        egui::MouseWheelUnit::Point => *delta,
+                        egui::MouseWheelUnit::Line => *delta * WHEEL_LINE,
+                        egui::MouseWheelUnit::Page => *delta * page,
+                    };
+                    Some(if modifiers.shift {
+                        vec2(delta.x + delta.y, 0.0)
+                    } else {
+                        delta
+                    })
+                }
+                _ => None,
+            })
+            .fold(Vec2::ZERO, |total, delta| total + delta)
+    })
+}
+
 pub fn show(
     ui: &mut Ui,
     id: Id,
@@ -667,7 +755,20 @@ pub fn show(
             .get(*para)
             .is_some_and(|para| para.picture.is_some())
     });
-    ScrollArea::both().auto_shrink(false).show(ui, |ui| {
+    let wheel = egui::scroll_area::ScrollSource {
+        mouse_wheel: false,
+        ..Default::default()
+    };
+    // The wheel is read here: each turn moves the pages at once, and none is lost while
+    // they still move.
+    let area = ScrollArea::both().scroll_source(wheel).animated(false);
+    area.auto_shrink(false).show(ui, |ui| {
+        if ui.rect_contains_pointer(ui.clip_rect()) {
+            let delta = wheel_delta(ui);
+            if delta != Vec2::ZERO {
+                ui.scroll_with_delta(delta);
+            }
+        }
         let pages = layout::layout(ui.painter(), doc, zoom);
         out.pages = pages.pages;
         out.para_pages.clone_from(&pages.para_pages);
@@ -681,7 +782,10 @@ pub fn show(
             page_size,
         );
         let text_area = Rect::from_min_size(
-            first_page.min + Vec2::splat(layout::margin(doc.page, zoom)),
+            first_page.min + {
+                let [top, _, _, left] = layout::margins(doc.page, zoom);
+                vec2(left, top)
+            },
             pages.galley.size(),
         );
         let origin = text_area.min.to_vec2();
@@ -693,7 +797,7 @@ pub fn show(
                 .map(|cell| cell.rect.translate(origin))
                 .collect();
         }
-        paint_pages(ui, &pages, first_page, origin, zoom, doc);
+        paint_pages(ui, &pages, first_page, origin, zoom, doc, view.plain);
         paint_pictures(ui, &pages, origin, doc, hooks.textures);
         if let Some(index) = view.scroll_to.take() {
             let caret = pages.galley.pos_from_cursor(CCursor::new(index));
@@ -798,6 +902,7 @@ pub fn show(
                 }
             }
             paint_underlines(ui, &output.galley, output.galley_pos, doc, zoom);
+            paint_misspelled(ui, &output.galley, output.galley_pos, &view.misspelled);
             if view.marks {
                 paint_marks(ui, &output.galley, output.galley_pos, doc, zoom);
             }
@@ -812,7 +917,7 @@ pub fn show(
             // As tall as the text typed there, not as the line, which line spacing makes
             // taller. Text sits at the top of its share of the line, shares at its bottom.
             let size = typing.size * zoom;
-            let spacing = doc.paras()[doc.para_at(index)].spacing.factor();
+            let spacing = doc.paras()[doc.para_at(index)].line_factor();
             let top = line
                 .top()
                 .max(line.bottom() - size * layout::LINE_HEIGHT * spacing);

@@ -960,22 +960,24 @@ dependencies = [
 
 [[package]]
 name = "goddoc"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "eframe",
  "egui",
  "egui-phosphor",
+ "flate2",
  "goddoc-core",
  "image",
  "rfd",
  "serde_json",
+ "spellbook",
  "ureq",
  "winresource",
 ]
 
 [[package]]
 name = "goddoc-core"
-version = "1.3.1"
+version = "1.4.0"
 dependencies = [
  "quick-xml 0.37.5",
  "thiserror 2.0.21",
@@ -2469,6 +2471,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
+]
+
+[[package]]
+name = "spellbook"
+version = "0.4.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0d204abcbdf8e88729306a8d0ca01a79d8a49969fe1f84696909d6dbc4321c1a"
+dependencies = [
+ "foldhash",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]

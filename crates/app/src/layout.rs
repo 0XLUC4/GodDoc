@@ -9,7 +9,7 @@ use std::sync::Arc;
 use egui::epaint::text::PlacedRow;
 use egui::text::{LayoutJob, TextFormat};
 use egui::{Color32, FontFamily, FontId, Galley, Painter, Pos2, Rect, Stroke, Vec2, pos2, vec2};
-use goddoc_core::{Align, Document, Font, Format, PageSetup, Para, Picture, Script};
+use goddoc_core::{Align, Document, Font, Format, PageSetup, Para, Picture, Script, Wrap};
 
 /// Space between two pages on screen.
 pub const PAGE_GAP: f32 = 18.0;
@@ -26,9 +26,11 @@ const MARKER_LEAD: f32 = 4.0;
 const MARKER_GAP: f32 = 5.0;
 /// Space between a table cell's border and its text, in points.
 const CELL_PAD: f32 = 5.0;
+/// Space between the columns of a page, in points.
+const COLUMN_GAP: f32 = 36.0;
 
 /// (font, bold, egui family name, Windows file, other systems).
-const FACES: [(Font, bool, &str, &str, &str); 16] = [
+const FACES: [(Font, bool, &str, &str, &str); 40] = [
     (
         Font::Sans,
         false,
@@ -141,6 +143,174 @@ const FACES: [(Font, bool, &str, &str, &str); 16] = [
         "comicbd.ttf",
         "ComicNeue-Bold.ttf",
     ),
+    (
+        Font::SegoeUi,
+        false,
+        "doc-segoe",
+        "segoeui.ttf",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::SegoeUi,
+        true,
+        "doc-segoe-bold",
+        "segoeuib.ttf",
+        "LiberationSans-Bold.ttf",
+    ),
+    (
+        Font::Consolas,
+        false,
+        "doc-consolas",
+        "consola.ttf",
+        "LiberationMono-Regular.ttf",
+    ),
+    (
+        Font::Consolas,
+        true,
+        "doc-consolas-bold",
+        "consolab.ttf",
+        "LiberationMono-Bold.ttf",
+    ),
+    (
+        Font::Trebuchet,
+        false,
+        "doc-trebuchet",
+        "trebuc.ttf",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::Trebuchet,
+        true,
+        "doc-trebuchet-bold",
+        "trebucbd.ttf",
+        "LiberationSans-Bold.ttf",
+    ),
+    (
+        Font::Cambria,
+        false,
+        "doc-cambria",
+        "cambria.ttc",
+        "LiberationSerif-Regular.ttf",
+    ),
+    (
+        Font::Cambria,
+        true,
+        "doc-cambria-bold",
+        "cambriab.ttf",
+        "LiberationSerif-Bold.ttf",
+    ),
+    (
+        Font::Candara,
+        false,
+        "doc-candara",
+        "Candara.ttf",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::Candara,
+        true,
+        "doc-candara-bold",
+        "Candarab.ttf",
+        "LiberationSans-Bold.ttf",
+    ),
+    (
+        Font::Constantia,
+        false,
+        "doc-constantia",
+        "constan.ttf",
+        "LiberationSerif-Regular.ttf",
+    ),
+    (
+        Font::Constantia,
+        true,
+        "doc-constantia-bold",
+        "constanb.ttf",
+        "LiberationSerif-Bold.ttf",
+    ),
+    (
+        Font::Corbel,
+        false,
+        "doc-corbel",
+        "corbel.ttf",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::Corbel,
+        true,
+        "doc-corbel-bold",
+        "corbelb.ttf",
+        "LiberationSans-Bold.ttf",
+    ),
+    (
+        Font::Palatino,
+        false,
+        "doc-palatino",
+        "pala.ttf",
+        "LiberationSerif-Regular.ttf",
+    ),
+    (
+        Font::Palatino,
+        true,
+        "doc-palatino-bold",
+        "palab.ttf",
+        "LiberationSerif-Bold.ttf",
+    ),
+    (
+        Font::Garamond,
+        false,
+        "doc-garamond",
+        "GARA.TTF",
+        "LiberationSerif-Regular.ttf",
+    ),
+    (
+        Font::Garamond,
+        true,
+        "doc-garamond-bold",
+        "GARABD.TTF",
+        "LiberationSerif-Bold.ttf",
+    ),
+    (
+        Font::CenturyGothic,
+        false,
+        "doc-gothic",
+        "GOTHIC.TTF",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::CenturyGothic,
+        true,
+        "doc-gothic-bold",
+        "GOTHICB.TTF",
+        "LiberationSans-Bold.ttf",
+    ),
+    (
+        Font::BookAntiqua,
+        false,
+        "doc-antiqua",
+        "BKANT.TTF",
+        "LiberationSerif-Regular.ttf",
+    ),
+    (
+        Font::BookAntiqua,
+        true,
+        "doc-antiqua-bold",
+        "ANTQUAB.TTF",
+        "LiberationSerif-Bold.ttf",
+    ),
+    (
+        Font::Impact,
+        false,
+        "doc-impact",
+        "impact.ttf",
+        "LiberationSans-Regular.ttf",
+    ),
+    (
+        Font::Impact,
+        true,
+        "doc-impact-bold",
+        "impact.ttf",
+        "LiberationSans-Bold.ttf",
+    ),
 ];
 
 /// Register the document fonts from the system (Arial, Times New Roman, Courier New or their
@@ -151,9 +321,13 @@ pub fn install_fonts(fonts: &mut egui::FontDefinitions) {
         .get(&FontFamily::Proportional)
         .cloned()
         .unwrap_or_default();
-    for (_, _, name, windows, other) in FACES {
+    let mut found = Vec::new();
+    for (font, bold, name, windows, other) in FACES {
         let mut family = fallback.clone();
         if let Some(bytes) = system_font(windows, other) {
+            if !bold {
+                found.push(font);
+            }
             fonts
                 .font_data
                 .insert(name.to_owned(), egui::FontData::from_owned(bytes).into());
@@ -161,6 +335,22 @@ pub fn install_fonts(fonts: &mut egui::FontDefinitions) {
         }
         fonts.families.insert(FontFamily::Name(name.into()), family);
     }
+    let _ = FOUND.set(found);
+}
+
+/// The fonts this computer has, set by [`install_fonts`].
+static FOUND: std::sync::OnceLock<Vec<Font>> = std::sync::OnceLock::new();
+
+/// The fonts to offer, by name: those this computer has, and `current`, which a document
+/// may ask for all the same.
+pub fn fonts(current: Font) -> Vec<Font> {
+    let found = FOUND.get().map_or(&[][..], Vec::as_slice);
+    let mut fonts: Vec<Font> = Font::ALL
+        .into_iter()
+        .filter(|font| *font == current || found.contains(font))
+        .collect();
+    fonts.sort_by_key(|font| font.family());
+    fonts
 }
 
 fn system_font(windows: &str, other: &str) -> Option<Vec<u8>> {
@@ -186,7 +376,7 @@ fn system_font(windows: &str, other: &str) -> Option<Vec<u8>> {
         .find_map(|path| std::fs::read(path).ok())
 }
 
-fn family(font: Font, bold: bool) -> FontFamily {
+pub fn family(font: Font, bold: bool) -> FontFamily {
     let name = FACES
         .iter()
         .find(|face| face.0 == font && face.1 == bold)
@@ -194,8 +384,29 @@ fn family(font: Font, bold: bool) -> FontFamily {
     FontFamily::Name(name.into())
 }
 
+/// Colour of text put in or taken out while changes were tracked.
+const TRACKED: [u8; 3] = [0xB4, 0x23, 0x8C];
+/// Background of text a comment is about.
+const NOTED: [u8; 3] = [0xFF, 0xE9, 0xA8];
+
+/// How `format` shows: a tracked change and a comment each add their mark to the look the
+/// text was given.
+pub fn shown(format: &Format) -> Format {
+    let mut shown = *format;
+    match format.change {
+        goddoc_core::Change::None => {}
+        goddoc_core::Change::Inserted => (shown.color, shown.underline) = (TRACKED, true),
+        goddoc_core::Change::Deleted => (shown.color, shown.strike) = (TRACKED, true),
+    }
+    if format.note != 0 && shown.highlight.is_none() {
+        shown.highlight = Some(NOTED);
+    }
+    shown
+}
+
 /// How `format` is drawn at `zoom`; `spacing` is the paragraph's line spacing factor.
 pub fn text_format(format: &Format, zoom: f32, spacing: f32) -> TextFormat {
+    let format = &shown(format);
     let [r, g, b] = format.color;
     let color = Color32::from_rgb(r, g, b);
     let full = (format.size * zoom).max(1.0);
@@ -233,14 +444,25 @@ pub fn page_size(page: PageSetup, zoom: f32) -> Vec2 {
     vec2(width, height) * zoom
 }
 
-/// Width of the margins on screen.
-pub fn margin(page: PageSetup, zoom: f32) -> f32 {
-    page.margins.points() * zoom
+/// The margins on screen: top, right, bottom, left.
+pub fn margins(page: PageSetup, zoom: f32) -> [f32; 4] {
+    page.margin_points().map(|side| side * zoom)
 }
 
 /// Size of the text area of a page on screen.
 pub fn content_size(page: PageSetup, zoom: f32) -> Vec2 {
-    page_size(page, zoom) - Vec2::splat(2.0 * margin(page, zoom))
+    let [top, right, bottom, left] = margins(page, zoom);
+    page_size(page, zoom) - vec2(left + right, top + bottom)
+}
+
+/// A measure of a paragraph (twentieths of a point) on screen.
+fn measure(twips: impl Into<f32>, zoom: f32) -> f32 {
+    twips.into() / goddoc_core::TWIPS_PER_POINT * zoom
+}
+
+/// How far the first line of a paragraph starts before its other lines (a hanging indent).
+fn hanging(para: &Para, zoom: f32) -> f32 {
+    measure(para.first_line.min(0).unsigned_abs(), zoom)
 }
 
 /// Distance between the tops of two consecutive pages on screen.
@@ -277,6 +499,9 @@ pub struct Underline {
 /// of each of its characters. The text does not draw them itself: it would break them
 /// wherever the font, its weight or its size changes.
 pub fn underlines(galley: &Galley, formats: &[Format], zoom: f32, visible: Rect) -> Vec<Underline> {
+    // Text put in while changes were tracked is underlined too.
+    let marked: Vec<Format> = formats.iter().map(shown).collect();
+    let formats = marked.as_slice();
     let mut lines = Vec::new();
     let mut start = 0;
     for row in &galley.rows {
@@ -322,6 +547,43 @@ pub fn underlines(galley: &Galley, formats: &[Format], zoom: f32, visible: Rect)
     lines
 }
 
+/// Where to mark the words `ranges` (in characters, in order) of the rows of `galley` that
+/// show in `visible`: for each stretch, its left end under the text, and its length.
+pub fn marked_words(galley: &Galley, ranges: &[Range<usize>], visible: Rect) -> Vec<(Pos2, f32)> {
+    let mut marks = Vec::new();
+    let mut start = 0;
+    // The first range that may still reach the row.
+    let mut next = 0;
+    for row in &galley.rows {
+        let first = start;
+        start += row.char_count_including_newline().0;
+        while ranges.get(next).is_some_and(|range| range.end <= first) {
+            next += 1;
+        }
+        if row.max_y() < visible.top() || row.min_y() > visible.bottom() {
+            continue;
+        }
+        for range in ranges[next.min(ranges.len())..]
+            .iter()
+            .take_while(|range| range.start < start)
+        {
+            let from = range.start.max(first) - first;
+            let to = (range.end.min(start) - first).min(row.glyphs.len());
+            let Some(glyphs) = row.glyphs.get(from..to).filter(|glyphs| !glyphs.is_empty()) else {
+                continue;
+            };
+            let left = glyphs[0].pos.x;
+            let right = glyphs[glyphs.len() - 1].max_x();
+            let baseline = glyphs
+                .iter()
+                .map(|glyph| glyph.pos.y)
+                .fold(f32::MIN, f32::max);
+            marks.push((row.pos + vec2(left, baseline + 2.5), right - left));
+        }
+    }
+    marks
+}
+
 /// A picture as shown, above the text of paragraph `para`.
 pub struct PictureBox {
     pub rect: Rect,
@@ -343,6 +605,8 @@ pub struct PageLayout {
     pub galley: Arc<Galley>,
     pub pages: usize,
     pub cells: Vec<CellBox>,
+    /// The columns of the pages, when there are several: each with the rows it holds.
+    pub strips: Vec<CellBox>,
     pub markers: Vec<Marker>,
     pub pictures: Vec<PictureBox>,
     pub blocks: Vec<Block>,
@@ -495,6 +759,10 @@ struct Placer {
     step: f32,
     /// Height of the text area of a page.
     height: f32,
+    /// Column of the page the rows go in, how many there are, and how far apart they start.
+    strip: usize,
+    strips: usize,
+    stride: f32,
 }
 
 impl Placer {
@@ -508,20 +776,32 @@ impl Placer {
 
     fn new_page(&mut self) {
         self.page += 1;
+        self.strip = 0;
         self.y = self.top();
     }
 
-    /// Move to the next page when something `height` tall does not fit on this one.
+    /// Left edge of the column the rows go in.
+    fn x(&self) -> f32 {
+        self.strip as f32 * self.stride
+    }
+
+    /// Move to the next column, or to the next page after the last one, when something
+    /// `height` tall does not fit in this one.
     fn fit(&mut self, height: f32) {
         if self.y + height > self.top() + self.height + 0.5 && !self.at_top() {
-            self.new_page();
+            if self.strip + 1 < self.strips {
+                self.strip += 1;
+                self.y = self.top();
+            } else {
+                self.new_page();
+            }
         }
     }
 }
 
-/// Left inset of a paragraph from its indent level.
+/// Left inset of a paragraph: its indent level and the room it asks for beyond it.
 fn level_indent(para: &Para, zoom: f32) -> f32 {
-    f32::from(para.indent) * INDENT_STEP * zoom
+    f32::from(para.indent) * INDENT_STEP * zoom + measure(para.left, zoom)
 }
 
 /// Size on screen of the paragraph's picture, at most `max_width` wide (zero without one).
@@ -545,16 +825,19 @@ fn para_galley(
     let mut job = LayoutJob::default();
     job.wrap.max_width = wrap.max(1.0);
     job.justify = para.align == Align::Justify;
-    let spacing = para.spacing.factor();
+    let spacing = para.line_factor();
+    // The first line starts further right than the others.
+    let mut lead = measure(para.first_line.max(0), zoom);
     if formats.is_empty() {
         // An empty section still gives the caret its height.
-        job.append("", 0.0, text_format(&para.kind.format(), zoom, spacing));
+        job.append("", lead, text_format(&para.kind.format(), zoom, spacing));
     }
     let mut bytes = text.char_indices().map(|(byte, _)| byte).skip(1);
     let mut start = 0;
     for run in formats.chunk_by(|a, b| a == b) {
         let end = bytes.nth(run.len() - 1).unwrap_or(text.len());
-        job.append(&text[start..end], 0.0, text_format(&run[0], zoom, spacing));
+        let look = text_format(&run[0], zoom, spacing);
+        job.append(&text[start..end], std::mem::take(&mut lead), look);
         start = end;
     }
     painter.layout_job(job)
@@ -597,24 +880,50 @@ pub fn shift(align: Align, wrap: f32, width: f32) -> f32 {
 /// Lay the document out on pages at `zoom`.
 pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     let content = content_size(doc.page, zoom);
+    // The columns of a page: how many, how wide, how far apart they start.
+    let strips = usize::from(doc.page.columns.max(1));
+    let gap = COLUMN_GAP * zoom;
+    let strip_width = ((content.x - gap * (strips - 1) as f32) / strips as f32).max(1.0);
     let paras = doc.paras();
     let formats = doc.formats();
     let pad = CELL_PAD * zoom;
     // Space between a picture and the text under it.
     let picture_gap = 4.0 * zoom;
     let mut columns: HashMap<u32, f32> = HashMap::new();
-    for cell in paras.iter().filter_map(|para| para.cell) {
-        let count = columns.entry(cell.table).or_insert(1.0);
-        *count = count.max(f32::from(cell.col) + 1.0);
+    // Columns a paragraph's cell takes: more than one when cells were joined.
+    let joined = |para: &Para| f32::from(para.span.max(1));
+    for para in paras {
+        if let Some(cell) = para.cell {
+            let count = columns.entry(cell.table).or_insert(1.0);
+            *count = count.max(f32::from(cell.col) + joined(para));
+        }
     }
     // Width of the column a paragraph lives in, of what it can show, and of its text.
     let column_width = |para: &Para| match para.cell {
-        Some(cell) => content.x / columns[&cell.table],
-        None => content.x,
+        Some(cell) => strip_width / columns[&cell.table],
+        None => strip_width,
     };
     let inner_width = |para: &Para| {
         let padding = if para.cell.is_some() { 2.0 * pad } else { 0.0 };
-        column_width(para) - padding
+        column_width(para) * joined(para) - padding
+    };
+    // Size of a paragraph's picture when it stands beside the text (zero otherwise): no more
+    // than a good half of the width, so that words still fit beside it. Not in table cells.
+    let beside = |para: &Para| {
+        if para.wrap == Wrap::Above || para.cell.is_some() {
+            Vec2::ZERO
+        } else {
+            picture_size(para, inner_width(para) * 0.6, zoom)
+        }
+    };
+    // Room the text leaves at its left or at its right for the picture beside it.
+    let room_beside = |para: &Para, side: Wrap| {
+        let size = beside(para);
+        if para.wrap == side && size.x > 0.0 {
+            size.x + 2.0 * picture_gap
+        } else {
+            0.0
+        }
     };
     let mut starts = Vec::with_capacity(paras.len());
     let mut start = 0;
@@ -649,7 +958,9 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     let insets: Vec<f32> = (0..paras.len())
         .map(|index| {
             let para = &paras[index];
-            let level = level_indent(para, zoom);
+            // The lines after the first of a hanging paragraph start further right.
+            let level =
+                level_indent(para, zoom) + hanging(para, zoom) + room_beside(para, Wrap::Left);
             let Some(label) = &labels[index] else {
                 return level;
             };
@@ -663,9 +974,20 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             level + room.max(least)
         })
         .collect();
-    let wrap_of = |index: usize| inner_width(&paras[index]) - insets[index];
+    let wrap_of = |index: usize| {
+        let para = &paras[index];
+        inner_width(para)
+            - insets[index]
+            - measure(para.right, zoom)
+            - room_beside(para, Wrap::Right)
+    };
+    // Room above and under a paragraph.
+    let room = |para: &Para| (measure(para.before, zoom), measure(para.after, zoom));
     // Height a paragraph's picture takes, gap included.
     let picture_height = |para: &Para| {
+        if beside(para).x > 0.0 {
+            return 0.0;
+        }
         let size = picture_size(para, inner_width(para), zoom);
         if size.y > 0.0 {
             size.y + picture_gap
@@ -694,6 +1016,17 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         page: 0,
         step: page_step(doc.page, zoom),
         height: content.y,
+        strip: 0,
+        strips,
+        stride: strip_width + gap,
+    };
+    // Where each column of each page starts in the rows: (page, column, first row).
+    let mut starts_of: Vec<(usize, usize, usize)> = Vec::new();
+    let mut enter = |placer: &Placer, row: usize| {
+        let here = (placer.page, placer.strip);
+        if starts_of.last().is_none_or(|last| (last.0, last.1) != here) {
+            starts_of.push((here.0, here.1, row));
+        }
     };
     let mut cells: Vec<CellBox> = Vec::new();
     let mut markers = Vec::new();
@@ -718,7 +1051,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
                 pos: pos + vec2(lead(para), 0.0),
                 text,
                 format: marker_format(index),
-                spacing: para.spacing.factor(),
+                spacing: para.line_factor(),
             });
         }
     };
@@ -729,8 +1062,15 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
             return;
         };
         let max_width = inner_width(para);
-        let size = picture_size(para, max_width, zoom);
-        let corner = origin + vec2(shift(para.align, max_width, size.x), 0.0);
+        let aside = beside(para);
+        let (size, across) = if aside.x > 0.0 {
+            let right = para.wrap == Wrap::Right;
+            (aside, if right { max_width - aside.x } else { 0.0 })
+        } else {
+            let size = picture_size(para, max_width, zoom);
+            (size, shift(para.align, max_width, size.x))
+        };
+        let corner = origin + vec2(across, 0.0);
         pictures.push(PictureBox {
             rect: Rect::from_min_size(corner.round(), size),
             para: index,
@@ -748,17 +1088,26 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
                 placer.new_page();
             }
             let inset = insets[index];
+            let (before, after) = room(para);
             let rows = &mut galley.rows[rows_of(index)];
             // A picture stays with the first line under it.
-            placer.fit(picture_height(para) + rows[0].size.y);
+            let first = (picture_height(para) + rows[0].size.y).max(beside(para).y);
+            placer.fit(before + first);
             para_pages.push(placer.page);
-            let top = placer.y;
-            show_picture(index, pos2(0.0, placer.y));
+            let started = (placer.page, placer.strip);
+            let mut top = placer.y;
+            placer.y += before;
+            // The text goes at least as far down as the picture beside it.
+            let under_picture = placer.y + beside(para).y;
+            show_picture(index, pos2(placer.x(), placer.y));
             placer.y += picture_height(para);
-            mark(index, pos2(level_indent(para, zoom), placer.y));
-            for row in rows {
+            mark(index, pos2(placer.x() + level_indent(para, zoom), placer.y));
+            let mut hang = hanging(para, zoom);
+            for (offset, row) in rows.iter_mut().enumerate() {
                 placer.fit(row.size.y);
-                let origin = pos2(inset, placer.y);
+                enter(&placer, first_rows[index] + offset);
+                // Only the first line hangs out.
+                let origin = pos2(placer.x() + inset - std::mem::take(&mut hang), placer.y);
                 placer.y += stack(
                     std::slice::from_mut(row),
                     origin,
@@ -766,13 +1115,22 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
                     para.align,
                 );
             }
+            if started == (placer.page, placer.strip) {
+                placer.y = placer.y.max(under_picture);
+            }
+            placer.y += after;
             if para.rule {
                 placer.y += 3.0 * zoom;
-                rules.push((pos2(0.0, placer.y.round()), content.x));
+                rules.push((pos2(placer.x(), placer.y.round()), strip_width));
                 placer.y += 4.0 * zoom;
             }
+            // A paragraph that went on to another column or page is grabbed by its end.
+            if started != (placer.page, placer.strip) {
+                top = placer.top();
+            }
+            let corner = pos2(placer.x(), top);
             blocks.push(Block {
-                rect: Rect::from_min_max(pos2(0.0, top), pos2(content.x, placer.y)),
+                rect: Rect::from_min_max(corner, pos2(placer.x() + strip_width, placer.y)),
                 paras: index..index + 1,
             });
             index += 1;
@@ -792,7 +1150,8 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         let width = column_width(para);
         let height_of = |index: usize| -> f32 {
             let rows: f32 = galleys[index].rows.iter().map(|row| row.size.y).sum();
-            rows + picture_height(&paras[index])
+            let (before, after) = room(&paras[index]);
+            before + rows + picture_height(&paras[index]) + after
         };
         let mut heights: HashMap<u16, f32> = HashMap::new();
         for (offset, para) in paras[index..end].iter().enumerate() {
@@ -801,14 +1160,18 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
         }
         let row_height = heights.values().copied().fold(0.0, f32::max) + 2.0 * pad;
         placer.fit(row_height);
+        enter(&placer, first_rows[index]);
         para_pages.resize(end, placer.page);
         let top = placer.y;
+        let across = placer.x();
         let mut used: HashMap<u16, f32> = HashMap::new();
         for index in index..end {
             let para = &paras[index];
             let col = para.cell.map_or(0, |cell| cell.col);
-            let left = f32::from(col) * width;
+            let left = across + f32::from(col) * width;
             let used = used.entry(col).or_default();
+            let (before, after) = room(para);
+            *used += before;
             show_picture(index, pos2(left + pad, top + pad + *used));
             *used += picture_height(para);
             let origin = pos2(left + pad, top + pad + *used);
@@ -821,7 +1184,11 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
                 wrap_of(index),
                 para.align,
             );
-            let rect = Rect::from_min_size(pos2(left, top), vec2(width, row_height));
+            *used += after;
+            if let Some(first) = galley.rows[rows.clone()].first_mut() {
+                first.pos.x -= hanging(para, zoom);
+            }
+            let rect = Rect::from_min_size(pos2(left, top), vec2(width * joined(para), row_height));
             match cells.last_mut() {
                 // Another paragraph of the same cell.
                 Some(last) if last.rect == rect => last.rows.end = rows.end,
@@ -839,7 +1206,7 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
                 block.paras.end = end;
             }
             _ => blocks.push(Block {
-                rect: Rect::from_min_max(pos2(0.0, top), pos2(content.x, placer.y)),
+                rect: Rect::from_min_max(pos2(across, top), pos2(across + strip_width, placer.y)),
                 paras: index..end,
             }),
         }
@@ -851,7 +1218,28 @@ pub fn layout(painter: &Painter, doc: &Document, zoom: f32) -> PageLayout {
     galley.mesh_bounds = galley.rows.iter().fold(Rect::NOTHING, |bounds, row| {
         bounds.union(row.visuals.mesh_bounds.translate(row.pos.to_vec2()))
     });
+    // With several columns, a click finds its row among those of the column it is in.
+    let mut strip_boxes = Vec::new();
+    if strips > 1 {
+        let counts: Vec<usize> = galley
+            .rows
+            .iter()
+            .map(|row| row.char_count_including_newline().0)
+            .collect();
+        for (at, (page, strip, first)) in starts_of.iter().enumerate() {
+            let end = starts_of
+                .get(at + 1)
+                .map_or(galley.rows.len(), |next| next.2);
+            let corner = pos2(*strip as f32 * placer.stride, *page as f32 * placer.step);
+            strip_boxes.push(CellBox {
+                rect: Rect::from_min_size(corner, vec2(strip_width, content.y)),
+                rows: *first..end,
+                chars: counts[..*first].iter().sum(),
+            });
+        }
+    }
     PageLayout {
+        strips: strip_boxes,
         galley: Arc::new(galley),
         pages: placer.page + 1,
         cells,

@@ -47,6 +47,27 @@ pub fn pick_export(name: &str, label: &str, extension: &str) -> Option<PathBuf> 
         .save_file()
 }
 
+/// Open `url` in the program the system has for it. Only addresses of the web and of mail:
+/// a document must not be able to start anything else.
+pub fn open_url(url: &str) -> Result<(), String> {
+    let known = ["http://", "https://", "mailto:"];
+    if !known.iter().any(|start| url.starts_with(start)) {
+        return Err(format!("Not a web or mail address: {url}"));
+    }
+    let opened = if cfg!(windows) {
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .spawn()
+    } else if cfg!(target_os = "macos") {
+        std::process::Command::new("open").arg(url).spawn()
+    } else {
+        std::process::Command::new("xdg-open").arg(url).spawn()
+    };
+    opened
+        .map(|_| ())
+        .map_err(|err| format!("Cannot open {url}: {err}"))
+}
+
 /// Write through a temporary file so a failure never leaves a half-written document.
 pub fn write_atomic(target: &Path, bytes: &[u8]) -> Result<(), String> {
     let mut temp_name = target

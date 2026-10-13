@@ -30,10 +30,22 @@ pub enum Font {
     Georgia,
     Tahoma,
     Comic,
+    SegoeUi,
+    Consolas,
+    Trebuchet,
+    Cambria,
+    Candara,
+    Constantia,
+    Corbel,
+    Palatino,
+    Garamond,
+    CenturyGothic,
+    BookAntiqua,
+    Impact,
 }
 
 impl Font {
-    pub const ALL: [Self; 8] = [
+    pub const ALL: [Self; 20] = [
         Self::Sans,
         Self::Serif,
         Self::Mono,
@@ -42,6 +54,18 @@ impl Font {
         Self::Georgia,
         Self::Tahoma,
         Self::Comic,
+        Self::SegoeUi,
+        Self::Consolas,
+        Self::Trebuchet,
+        Self::Cambria,
+        Self::Candara,
+        Self::Constantia,
+        Self::Corbel,
+        Self::Palatino,
+        Self::Garamond,
+        Self::CenturyGothic,
+        Self::BookAntiqua,
+        Self::Impact,
     ];
 
     /// Font family written into .docx files.
@@ -55,6 +79,18 @@ impl Font {
             Self::Georgia => "Georgia",
             Self::Tahoma => "Tahoma",
             Self::Comic => "Comic Sans MS",
+            Self::SegoeUi => "Segoe UI",
+            Self::Consolas => "Consolas",
+            Self::Trebuchet => "Trebuchet MS",
+            Self::Cambria => "Cambria",
+            Self::Candara => "Candara",
+            Self::Constantia => "Constantia",
+            Self::Corbel => "Corbel",
+            Self::Palatino => "Palatino Linotype",
+            Self::Garamond => "Garamond",
+            Self::CenturyGothic => "Century Gothic",
+            Self::BookAntiqua => "Book Antiqua",
+            Self::Impact => "Impact",
         }
     }
 }
@@ -66,6 +102,24 @@ pub enum Script {
     Normal,
     Super,
     Sub,
+}
+
+/// What tracking changes says of a piece of text.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Change {
+    #[default]
+    None,
+    /// Written while changes were tracked: accepting keeps it, rejecting takes it out.
+    Inserted,
+    /// Taken out while changes were tracked: it still shows, struck, until that is accepted.
+    Deleted,
+}
+
+/// What someone says about a piece of the text.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Comment {
+    pub author: String,
+    pub text: String,
 }
 
 /// Look of one character.
@@ -80,6 +134,12 @@ pub struct Format {
     pub strike: bool,
     /// RGB.
     pub color: [u8; 3],
+    /// The link the text opens: its place in [`Document::links`], counted from 1; 0 for none.
+    pub link: u16,
+    /// The comment made on the text: its place in [`Document::comments`], counted from 1.
+    pub note: u16,
+    /// Whether the text was put in or taken out while changes were tracked.
+    pub change: Change,
     /// Background colour behind the text (highlighter), RGB.
     pub highlight: Option<[u8; 3]>,
     pub script: Script,
@@ -97,27 +157,35 @@ pub enum Kind {
     #[default]
     Normal,
     Title,
+    /// A line under the title, saying more of what the document is.
+    Subtitle,
     Heading1,
     Heading2,
     Heading3,
+    /// Words of someone else, set apart.
+    Quote,
 }
 
 impl Kind {
-    pub const ALL: [Self; 5] = [
+    pub const ALL: [Self; 7] = [
         Self::Normal,
         Self::Title,
+        Self::Subtitle,
         Self::Heading1,
         Self::Heading2,
         Self::Heading3,
+        Self::Quote,
     ];
 
     pub fn name(self) -> &'static str {
         match self {
             Self::Normal => "Normal",
             Self::Title => "Title",
+            Self::Subtitle => "Subtitle",
             Self::Heading1 => "Heading 1",
             Self::Heading2 => "Heading 2",
             Self::Heading3 => "Heading 3",
+            Self::Quote => "Quote",
         }
     }
 
@@ -129,11 +197,12 @@ impl Kind {
         Self::HEADINGS.iter().position(|kind| *kind == self)
     }
 
-    /// Size and weight of text in a paragraph of this kind.
+    /// Size, weight and colour of text in a paragraph of this kind.
     pub fn format(self) -> Format {
         let (size, bold) = match self {
-            Self::Normal => (11.0, false),
+            Self::Normal | Self::Quote => (11.0, false),
             Self::Title => (26.0, true),
+            Self::Subtitle => (14.0, false),
             Self::Heading1 => (20.0, true),
             Self::Heading2 => (16.0, true),
             Self::Heading3 => (13.0, true),
@@ -142,10 +211,17 @@ impl Kind {
             font: Font::Sans,
             size,
             bold,
-            italic: false,
+            italic: self == Self::Quote,
             underline: false,
             strike: false,
-            color: [0, 0, 0],
+            color: if matches!(self, Self::Subtitle | Self::Quote) {
+                [0x59, 0x59, 0x59]
+            } else {
+                [0, 0, 0]
+            },
+            link: 0,
+            note: 0,
+            change: Change::None,
             highlight: None,
             script: Script::Normal,
         }
@@ -300,26 +376,108 @@ impl Margins {
     }
 }
 
-/// Paper (always A4) orientation and margins.
+/// A size of paper.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Paper {
+    #[default]
+    A4,
+    A3,
+    A5,
+    Letter,
+    Legal,
+}
+
+impl Paper {
+    pub const ALL: [Self; 5] = [Self::A4, Self::A3, Self::A5, Self::Letter, Self::Legal];
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Self::A4 => "A4 (21 x 29.7 cm)",
+            Self::A3 => "A3 (29.7 x 42 cm)",
+            Self::A5 => "A5 (14.8 x 21 cm)",
+            Self::Letter => "Letter (8.5 x 11 in)",
+            Self::Legal => "Legal (8.5 x 14 in)",
+        }
+    }
+
+    /// (width, height) of an upright sheet, in points.
+    pub fn points(self) -> (f32, f32) {
+        match self {
+            Self::A4 => (595.0, 842.0),
+            Self::A3 => (842.0, 1191.0),
+            Self::A5 => (420.0, 595.0),
+            Self::Letter => (612.0, 792.0),
+            Self::Legal => (612.0, 1008.0),
+        }
+    }
+
+    /// The paper closest to a sheet of `width` by `height` points, whichever way it is turned.
+    pub fn closest(width: f32, height: f32) -> Self {
+        let (short, long) = (width.min(height), width.max(height));
+        let off = |paper: &Self| {
+            let (paper_short, paper_long) = paper.points();
+            (paper_short - short).abs() + (paper_long - long).abs()
+        };
+        let closest = Self::ALL
+            .into_iter()
+            .min_by(|a, b| off(a).total_cmp(&off(b)));
+        closest.unwrap_or_default()
+    }
+}
+
+/// Paper, orientation and margins.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct PageSetup {
+    pub paper: Paper,
     pub landscape: bool,
     pub margins: Margins,
+    /// Margins of their own, each side set apart: top, right, bottom, left, in twentieths
+    /// of a point. `None` leaves them to `margins`.
+    pub custom: Option<[u16; 4]>,
+    /// Columns the text runs in, side by side on each page; 0 or 1 for one.
+    pub columns: u8,
 }
 
 impl PageSetup {
+    /// The margins: top, right, bottom, left, in points.
+    pub fn margin_points(self) -> [f32; 4] {
+        match self.custom {
+            Some(sides) => sides.map(|side| f32::from(side) / TWIPS_PER_POINT),
+            None => [self.margins.points(); 4],
+        }
+    }
+
+    /// Set each margin apart (top, right, bottom, left, in twentieths of a point). Four
+    /// sides that are one of the named margins become it.
+    pub fn set_margins(&mut self, sides: [u16; 4]) {
+        let points = sides.map(|side| f32::from(side) / TWIPS_PER_POINT);
+        let named = Margins::ALL.into_iter().find(|named| {
+            points
+                .iter()
+                .all(|side| (side - named.points()).abs() <= 2.0)
+        });
+        match named {
+            Some(named) => (self.margins, self.custom) = (named, None),
+            None => self.custom = Some(sides),
+        }
+    }
+
     /// (width, height) of a page, in points.
     pub fn size(self) -> (f32, f32) {
+        let (width, height) = self.paper.points();
         if self.landscape {
-            (842.0, 595.0)
+            (height, width)
         } else {
-            (595.0, 842.0)
+            (width, height)
         }
     }
 }
 
 /// Deepest indent level of a paragraph.
 pub const MAX_INDENT: u8 = 8;
+/// Measures of a paragraph and of the margins are kept in twentieths of a point, as Word
+/// files write them: whole numbers, so that two paragraphs can be told equal.
+pub const TWIPS_PER_POINT: f32 = 20.0;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct Para {
@@ -336,6 +494,57 @@ pub struct Para {
     pub indent: u8,
     /// A line is drawn across the page under the paragraph.
     pub rule: bool,
+    /// Room left of the text, beyond its indent level, in twentieths of a point.
+    pub left: u16,
+    /// Room right of the text, in twentieths of a point.
+    pub right: u16,
+    /// How far the first line starts right of the others, in twentieths of a point; left of
+    /// them when negative (a hanging indent).
+    pub first_line: i16,
+    /// Room above and under the paragraph, in twentieths of a point.
+    pub before: u16,
+    pub after: u16,
+    /// Height of its lines, in hundredths of single spacing; 0 leaves it to `spacing`.
+    pub line: u16,
+    /// Columns its table cell takes when cells were joined (every paragraph of the cell
+    /// says so); 0 for a cell of one column.
+    pub span: u8,
+    /// Where its picture stands: above its text, or beside it.
+    pub wrap: Wrap,
+}
+
+/// Where the picture of a paragraph stands.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Wrap {
+    /// Above the text, which reads as its caption.
+    #[default]
+    Above,
+    /// At the left of the text, which runs beside it.
+    Left,
+    /// At the right of the text.
+    Right,
+}
+
+impl Para {
+    /// Line height relative to single spacing.
+    pub fn line_factor(&self) -> f32 {
+        if self.line == 0 {
+            self.spacing.factor()
+        } else {
+            f32::from(self.line) / 100.0
+        }
+    }
+
+    /// Set the height of the lines, in hundredths of single spacing.
+    pub fn set_line(&mut self, hundredths: u16) {
+        let named = Spacing::ALL
+            .into_iter()
+            .find(|spacing| (spacing.factor() * 100.0).round() as u16 == hundredths);
+        (self.spacing, self.line) = match named {
+            Some(spacing) => (spacing, 0),
+            None => (Spacing::Single, hundredths.clamp(50, 500)),
+        };
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -390,6 +599,44 @@ pub struct Document {
     /// Show the page number at the bottom of every page.
     pub page_numbers: bool,
     pub page: PageSetup,
+    /// What every page says in its top margin, and in its bottom one.
+    pub header: Banner,
+    pub footer: Banner,
+    /// Where the links of the text lead; only ever added to, so that their places stay.
+    pub links: Vec<String>,
+    /// The comments made on the text; only ever added to as well.
+    pub comments: Vec<Comment>,
+}
+
+/// What is written in the top or the bottom margin of every page: at its left, in its
+/// middle and at its right. `{page}` stands for the number of the page, `{pages}` for how
+/// many there are.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Banner {
+    pub left: String,
+    pub center: String,
+    pub right: String,
+}
+
+impl Banner {
+    /// The number of the page, where it is written in a banner.
+    pub const PAGE: &str = "{page}";
+    /// The count of pages, where it is written in a banner.
+    pub const PAGES: &str = "{pages}";
+
+    pub fn zones(&self) -> [&str; 3] {
+        [&self.left, &self.center, &self.right]
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.zones().iter().all(|zone| zone.trim().is_empty())
+    }
+
+    /// What `zone` says on page `page` (the first is 1) of `pages`.
+    pub fn on_page(zone: &str, page: usize, pages: usize) -> String {
+        let counted = zone.replace(Self::PAGES, &pages.to_string());
+        counted.replace(Self::PAGE, &page.to_string())
+    }
 }
 
 impl Default for Document {
@@ -401,7 +648,89 @@ impl Default for Document {
             images: Vec::new(),
             page_numbers: false,
             page: PageSetup::default(),
+            header: Banner::default(),
+            footer: Banner::default(),
+            links: Vec::new(),
+            comments: Vec::new(),
         }
+    }
+}
+
+impl Document {
+    /// The number text carries to open `url`: its place among the links, added if new.
+    pub fn link_to(&mut self, url: &str) -> u16 {
+        let place = self.links.iter().position(|link| link == url);
+        let place = place.unwrap_or_else(|| {
+            self.links.push(url.to_owned());
+            self.links.len() - 1
+        });
+        u16::try_from(place + 1).unwrap_or(0)
+    }
+
+    /// Where the link numbered `link` leads.
+    pub fn link(&self, link: u16) -> Option<&str> {
+        let place = usize::from(link).checked_sub(1)?;
+        self.links.get(place).map(String::as_str)
+    }
+
+    /// Add a comment; gives the number the text it is about carries.
+    pub fn add_comment(&mut self, comment: Comment) -> u16 {
+        self.comments.push(comment);
+        u16::try_from(self.comments.len()).unwrap_or(0)
+    }
+
+    /// The characters the comment numbered `note` is about, from the first to after the last.
+    pub fn noted(&self, note: u16) -> Option<Range<usize>> {
+        let first = self.formats.iter().position(|format| format.note == note)?;
+        let last = self
+            .formats
+            .iter()
+            .rposition(|format| format.note == note)?;
+        Some(first..last + 1)
+    }
+
+    /// Settle the tracked changes of `range`: keep them (`accept`) or undo them. What was
+    /// put in stays or goes, what was taken out goes or comes back.
+    pub fn settle_changes(&mut self, range: Range<usize>, accept: bool) {
+        let gone = if accept {
+            Change::Deleted
+        } else {
+            Change::Inserted
+        };
+        let end = range.end.min(self.len());
+        // From the end, so that what is taken out does not move what is still to see.
+        let mut at = end;
+        while at > range.start {
+            let change = self.formats[at - 1].change;
+            let from = (range.start..at)
+                .rev()
+                .take_while(|index| self.formats[*index].change == change)
+                .last()
+                .unwrap_or(at - 1);
+            if change == gone {
+                let format = self.formats[from];
+                self.replace(from..at, "", format);
+            } else if change != Change::None {
+                self.restyle(from..at, |format| format.change = Change::None);
+            }
+            at = from;
+        }
+    }
+    /// The footer as pages show it: with the page number in its middle when page numbers
+    /// are on and the footer does not place it itself.
+    pub fn shown_footer(&self) -> Banner {
+        let mut footer = self.footer.clone();
+        let placed = footer
+            .zones()
+            .iter()
+            .any(|zone| zone.contains(Banner::PAGE));
+        if self.page_numbers && !placed {
+            if !footer.center.trim().is_empty() {
+                footer.center.push(' ');
+            }
+            footer.center.push_str(Banner::PAGE);
+        }
+        footer
     }
 }
 
@@ -642,11 +971,20 @@ impl Document {
     pub fn set_kind(&mut self, paras: Range<usize>, kind: Kind) {
         let look = kind.format();
         for para in paras {
+            let before = self.paras[para].kind.format();
             self.paras[para].kind = kind;
             let chars = self.para_chars(para);
             self.restyle(chars, |format| {
                 format.size = look.size;
                 format.bold = look.bold;
+                // The slant and the colour of a style come and go with it; between styles
+                // that have none of their own, they stay as the writer set them.
+                if look.italic != before.italic {
+                    format.italic = look.italic;
+                }
+                if look.color != before.color {
+                    format.color = look.color;
+                }
             });
         }
     }
@@ -835,12 +1173,79 @@ impl Document {
 
     /// (rows, columns) of the table `table`.
     pub fn table_size(&self, table: u32) -> (u16, u16) {
-        let cells = self.paras.iter().filter_map(|para| para.cell);
+        let cells = self
+            .paras
+            .iter()
+            .filter_map(|para| Some((para.cell?, para.span)));
         cells
-            .filter(|cell| cell.table == table)
-            .fold((0, 0), |(rows, cols), cell| {
-                (rows.max(cell.row + 1), cols.max(cell.col + 1))
+            .filter(|(cell, _)| cell.table == table)
+            .fold((0, 0), |(rows, cols), (cell, span)| {
+                let end = cell.col + u16::from(span.max(1));
+                (rows.max(cell.row + 1), cols.max(end))
             })
+    }
+
+    /// Columns the cell `cell` takes: more than one when cells were joined.
+    pub fn cell_span(&self, cell: Cell) -> u16 {
+        let first = self.paras.iter().find(|para| para.cell == Some(cell));
+        first.map_or(1, |para| u16::from(para.span.max(1)))
+    }
+
+    /// Whether some cells of `table` are joined.
+    pub fn has_joined_cells(&self, table: u32) -> bool {
+        let joined =
+            |para: &Para| para.span > 1 && para.cell.is_some_and(|cell| cell.table == table);
+        self.paras.iter().any(joined)
+    }
+
+    /// Join the cell `cell` with the one at its right, whose text comes after its own.
+    /// False when there is none.
+    pub fn merge_cell_right(&mut self, cell: Cell) -> bool {
+        let own = self.cell_span(cell);
+        let next = Cell {
+            col: cell.col + own,
+            ..cell
+        };
+        if !self.paras.iter().any(|para| para.cell == Some(next)) {
+            return false;
+        }
+        let joined = u8::try_from(own + self.cell_span(next)).unwrap_or(u8::MAX);
+        for para in &mut self.paras {
+            if para.cell == Some(next) {
+                para.cell = Some(cell);
+            }
+            if para.cell == Some(cell) {
+                para.span = joined;
+            }
+        }
+        true
+    }
+
+    /// Give back to the joined cell `cell` the cells it covers: its text stays in the first.
+    /// False when it is not joined.
+    pub fn split_cell(&mut self, cell: Cell) -> bool {
+        let span = self.cell_span(cell);
+        let mut blocks = self.blocks();
+        let Some(last) = blocks.iter().rposition(|block| block.2.cell == Some(cell)) else {
+            return false;
+        };
+        if span <= 1 {
+            return false;
+        }
+        for block in &mut blocks {
+            if block.2.cell == Some(cell) {
+                block.2.span = 0;
+            }
+        }
+        let freed = (1..span).map(|offset| {
+            empty_cell(Cell {
+                col: cell.col + offset,
+                ..cell
+            })
+        });
+        blocks.splice(last + 1..last + 1, freed);
+        self.rebuild(blocks);
+        true
     }
 
     /// Add an empty row above or below the row of `cell`. Returns the caret position in it.

@@ -5,7 +5,12 @@ mod app;
 mod branding;
 mod editor;
 mod layout;
+mod pdf;
 mod platform;
+#[cfg(windows)]
+mod print;
+mod render;
+mod spell;
 mod theme;
 mod toasts;
 mod updates;

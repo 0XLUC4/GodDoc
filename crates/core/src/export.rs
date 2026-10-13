@@ -93,16 +93,17 @@ pub fn markdown(doc: &Document) -> String {
             }
         };
         let para = line.para;
-        let heading = para.kind != Kind::Normal;
+        let heading = !matches!(para.kind, Kind::Normal | Kind::Subtitle | Kind::Quote);
         let prefix = match (para.kind, &line.marker) {
             (Kind::Title | Kind::Heading1, _) => "# ".to_owned(),
+            (Kind::Quote, _) => "> ".to_owned(),
             (Kind::Heading2, _) => "## ".to_owned(),
             (Kind::Heading3, _) => "### ".to_owned(),
-            (Kind::Normal, Some(marker)) => {
+            (Kind::Normal | Kind::Subtitle, Some(marker)) => {
                 let bullet = if marker.ends_with('.') { marker } else { "-" };
                 format!("{}{bullet} ", "    ".repeat(usize::from(para.indent)))
             }
-            (Kind::Normal, None) => String::new(),
+            (Kind::Normal | Kind::Subtitle, None) => String::new(),
         };
         // Items of a list follow each other; anything else stands apart.
         let together = previous.is_some_and(|before| listed(before) && listed(para));
@@ -191,7 +192,8 @@ pub fn html(doc: &Document, title: &str) -> String {
 fn html_para(line: &Line<'_>) -> String {
     let para = line.para;
     let tag = match para.kind {
-        Kind::Normal => "p",
+        Kind::Normal | Kind::Subtitle => "p",
+        Kind::Quote => "blockquote",
         Kind::Title | Kind::Heading1 => "h1",
         Kind::Heading2 => "h2",
         Kind::Heading3 => "h3",

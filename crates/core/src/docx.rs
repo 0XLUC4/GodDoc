@@ -5,18 +5,19 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{Cursor, Read as _, Write as _};
+use std::ops::Range;
 use std::rc::Rc;
 
 use quick_xml::Reader;
 use quick_xml::events::{BytesStart, Event};
 
 use crate::{
-    Align, Cell, Document, Error, Font, Format, Image, ImageKind, Kind, List, MAX_INDENT, Margins,
-    PageSetup, Para, Picture, Result, Script, Spacing,
+    Align, Banner, Cell, Change, Comment, Document, Error, Font, Format, Image, ImageKind, Kind,
+    List, MAX_INDENT, PageSetup, Paper, Para, Picture, Result, Script, Wrap,
 };
 
 const CONTENT_TYPES: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
-<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#;
+<Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Default Extension="png" ContentType="image/png"/><Default Extension="jpeg" ContentType="image/jpeg"/><Override PartName="/word/footer1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.footer+xml"/><Override PartName="/word/header1.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.header+xml"/><Override PartName="/word/comments.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.comments+xml"/><Override PartName="/word/document.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.document.main+xml"/><Override PartName="/word/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.styles+xml"/><Override PartName="/word/numbering.xml" ContentType="application/vnd.openxmlformats-officedocument.wordprocessingml.numbering+xml"/></Types>"#;
 
 const ROOT_RELS: &str = r#"<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/></Relationships>"#;
@@ -36,32 +37,124 @@ const INDENT_STEP: u32 = 720;
 fn page_setup_xml(page: PageSetup) -> String {
     let (width, height) = page.size();
     let (width, height) = ((width * TWIPS) as u32, (height * TWIPS) as u32);
-    let margin = (page.margins.points() * TWIPS) as u32;
+    let [top, right, bottom, left] = page.margin_points().map(|side| (side * TWIPS) as u32);
     let orient = if page.landscape {
         r#" w:orient="landscape""#
     } else {
         ""
     };
+    // Text in columns: half an inch between them.
+    let columns = if page.columns > 1 {
+        format!(r#"<w:cols w:num="{}" w:space="720"/>"#, page.columns)
+    } else {
+        String::new()
+    };
     format!(
-        r#"<w:pgSz w:w="{width}" w:h="{height}"{orient}/><w:pgMar w:top="{margin}" w:right="{margin}" w:bottom="{margin}" w:left="{margin}" w:header="708" w:footer="708" w:gutter="0"/>"#
+        r#"<w:pgSz w:w="{width}" w:h="{height}"{orient}/><w:pgMar w:top="{top}" w:right="{right}" w:bottom="{bottom}" w:left="{left}" w:header="708" w:footer="708" w:gutter="0"/>{columns}"#
     )
 }
 
 /// Width between the margins, in twentieths of a point.
 fn content_width(page: PageSetup) -> u32 {
-    ((page.size().0 - 2.0 * page.margins.points()) * TWIPS) as u32
+    let [_, right, _, left] = page.margin_points();
+    ((page.size().0 - left - right) * TWIPS) as u32
 }
 
-/// Relationship of the footer that shows the page number.
+/// Relationships of the footer and of the header.
 const FOOTER_REL: &str = "rIdFooter";
+const HEADER_REL: &str = "rIdHeader";
 /// English Metric Units (the unit of drawing sizes) per point.
 const EMU_PER_POINT: f32 = 12700.0;
 
-/// `word/_rels/document.xml.rels`; `media` are the image files, in the order of their ids.
-fn document_rels(media: &[String]) -> String {
+/// Push `text` as the value of an attribute.
+fn push_attr(xml: &mut String, text: &str) {
+    for ch in text.chars() {
+        match ch {
+            '"' => xml.push_str("&quot;"),
+            ch => push_escaped(xml, ch),
+        }
+    }
+}
+
+/// `word/comments.xml`: the comments the text refers to, by their numbers less one.
+fn comments_xml(doc: &Document) -> String {
+    let mut xml = format!(r#"{XML_HEADER}<w:comments xmlns:w="{WORD_NS}">"#);
+    for (index, comment) in doc.comments.iter().enumerate() {
+        let note = u16::try_from(index + 1).unwrap_or(0);
+        if doc.noted(note).is_none() {
+            continue;
+        }
+        xml.push_str(&format!(r#"<w:comment w:id="{index}" w:author=""#));
+        push_attr(&mut xml, &comment.author);
+        xml.push_str(r#""><w:p><w:r><w:t xml:space="preserve">"#);
+        comment
+            .text
+            .chars()
+            .for_each(|ch| push_escaped(&mut xml, ch));
+        xml.push_str("</w:t></w:r></w:p></w:comment>");
+    }
+    xml.push_str("</w:comments>");
+    xml
+}
+
+/// The comments of a `word/comments.xml`, by the id the text refers to them with.
+fn read_comments(xml: &str) -> Vec<(String, Comment)> {
+    let mut reader = Reader::from_str(xml);
+    let mut comments: Vec<(String, Comment)> = Vec::new();
+    let mut in_text = false;
+    while let Ok(event) = reader.read_event() {
+        match &event {
+            Event::Eof => break,
+            Event::Start(tag) if tag.name().as_ref() == b"w:comment" => {
+                let id = attr(tag, b"w:id").unwrap_or_default().into_owned();
+                let author = attr(tag, b"w:author").unwrap_or_default().into_owned();
+                let comment = Comment {
+                    author,
+                    text: String::new(),
+                };
+                comments.push((id, comment));
+            }
+            Event::Start(tag) if tag.name().as_ref() == b"w:t" => in_text = true,
+            Event::End(tag) if tag.name().as_ref() == b"w:t" => in_text = false,
+            // Paragraphs of a comment are its lines.
+            Event::End(tag) if tag.name().as_ref() == b"w:p" => {
+                if let Some((_, comment)) = comments.last_mut() {
+                    comment.text.push('\n');
+                }
+            }
+            Event::Text(text) if in_text => {
+                if let Some((_, comment)) = comments.last_mut() {
+                    comment.text.push_str(&text.unescape().unwrap_or_default());
+                }
+            }
+            _ => {}
+        }
+    }
+    for (_, comment) in &mut comments {
+        comment.text = comment.text.trim().to_owned();
+    }
+    comments
+}
+
+/// Relationship of the link numbered `link`.
+fn link_rel(link: u16) -> String {
+    format!("rIdLink{link}")
+}
+
+/// `word/_rels/document.xml.rels`; `media` are the image files, in the order of their ids,
+/// `links` where the links of the text lead.
+fn document_rels(media: &[String], links: &[String]) -> String {
     let mut xml = format!(
-        r#"{XML_HEADER}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId2" Type="{RELS_NS}/numbering" Target="numbering.xml"/><Relationship Id="{FOOTER_REL}" Type="{RELS_NS}/footer" Target="footer1.xml"/>"#
+        r#"{XML_HEADER}<Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="{RELS_NS}/styles" Target="styles.xml"/><Relationship Id="rId2" Type="{RELS_NS}/numbering" Target="numbering.xml"/><Relationship Id="{FOOTER_REL}" Type="{RELS_NS}/footer" Target="footer1.xml"/><Relationship Id="{HEADER_REL}" Type="{RELS_NS}/header" Target="header1.xml"/><Relationship Id="rIdComments" Type="{RELS_NS}/comments" Target="comments.xml"/>"#
     );
+    for (index, link) in links.iter().enumerate() {
+        let id = link_rel(u16::try_from(index + 1).unwrap_or(0));
+        xml.push_str(&format!(
+            r#"<Relationship Id="{id}" Type="{RELS_NS}/hyperlink" TargetMode="External" Target=""#
+        ));
+        push_attr(&mut xml, link);
+        xml.push_str(r#""/>"#);
+    }
     for (index, file) in media.iter().enumerate() {
         xml.push_str(&format!(
             r#"<Relationship Id="{}" Type="{RELS_NS}/image" Target="media/{file}"/>"#,
@@ -76,14 +169,53 @@ fn image_rel(index: usize) -> String {
     format!("rIdImage{}", index + 1)
 }
 
-/// Footer with the page number in the middle.
-fn footer_xml() -> String {
+/// A header (`w:hdr`) or footer (`w:ftr`) part: one paragraph, its middle and its right
+/// reached by tabs set across the text area of `page`.
+fn banner_xml(root: &str, banner: &Banner, page: PageSetup) -> String {
     let field = |kind: &str| format!(r#"<w:r><w:fldChar w:fldCharType="{kind}"/></w:r>"#);
+    let number = |name: &str| {
+        format!(
+            r#"{}<w:r><w:instrText xml:space="preserve"> {name} </w:instrText></w:r>{}<w:r><w:t>1</w:t></w:r>{}"#,
+            field("begin"),
+            field("separate"),
+            field("end")
+        )
+    };
+    let written = |text: &str| {
+        let mut run = String::from(r#"<w:r><w:t xml:space="preserve">"#);
+        text.chars().for_each(|ch| push_escaped(&mut run, ch));
+        run + "</w:t></w:r>"
+    };
+    let zone = |text: &str| {
+        let mut xml = String::new();
+        let mut rest = text;
+        // The longer name first: the other one starts the same.
+        let fields = [(Banner::PAGES, "NUMPAGES"), (Banner::PAGE, "PAGE")];
+        while !rest.is_empty() {
+            let next = fields
+                .iter()
+                .filter_map(|(token, name)| Some((rest.find(token)?, *token, *name)))
+                .min_by_key(|(at, token, _)| (*at, std::cmp::Reverse(token.len())));
+            let Some((at, token, name)) = next else {
+                xml.push_str(&written(rest));
+                break;
+            };
+            if at > 0 {
+                xml.push_str(&written(&rest[..at]));
+            }
+            xml.push_str(&number(name));
+            rest = &rest[at + token.len()..];
+        }
+        xml
+    };
+    let width = content_width(page);
+    let middle = width / 2;
+    let tab = "<w:r><w:tab/></w:r>";
     format!(
-        r#"{XML_HEADER}<w:ftr xmlns:w="{WORD_NS}"><w:p><w:pPr><w:jc w:val="center"/></w:pPr>{}<w:r><w:instrText xml:space="preserve"> PAGE </w:instrText></w:r>{}<w:r><w:t>1</w:t></w:r>{}</w:p></w:ftr>"#,
-        field("begin"),
-        field("separate"),
-        field("end")
+        r#"{XML_HEADER}<{root} xmlns:w="{WORD_NS}"><w:p><w:pPr><w:tabs><w:tab w:val="center" w:pos="{middle}"/><w:tab w:val="right" w:pos="{width}"/></w:tabs></w:pPr>{}{tab}{}{tab}{}</w:p></{root}>"#,
+        zone(&banner.left),
+        zone(&banner.center),
+        zone(&banner.right)
     )
 }
 
@@ -109,15 +241,22 @@ impl Kind {
         match self {
             Self::Normal => "Normal",
             Self::Title => "Title",
+            Self::Subtitle => "Subtitle",
             Self::Heading1 => "Heading1",
             Self::Heading2 => "Heading2",
             Self::Heading3 => "Heading3",
+            Self::Quote => "Quote",
         }
     }
 
     /// Kind of a style id, English or French Word ("Heading1", "Titre1", "Title", "Titre").
     fn of_style(id: &str) -> Self {
         let id = id.to_ascii_lowercase();
+        match id.as_str() {
+            "subtitle" | "sous-titre" | "soustitre" => return Self::Subtitle,
+            "quote" | "citation" => return Self::Quote,
+            _ => {}
+        }
         let Some(level) = id
             .strip_prefix("heading")
             .or_else(|| id.strip_prefix("titre"))
@@ -158,10 +297,21 @@ pub fn write(doc: &Document) -> Result<Vec<u8>> {
     let mut parts: Vec<(String, Vec<u8>)> = [
         ("[Content_Types].xml", CONTENT_TYPES.to_owned()),
         ("_rels/.rels", ROOT_RELS.to_owned()),
-        ("word/_rels/document.xml.rels", document_rels(&names)),
+        (
+            "word/_rels/document.xml.rels",
+            document_rels(&names, &doc.links),
+        ),
+        ("word/comments.xml", comments_xml(doc)),
         ("word/styles.xml", styles_xml()),
         ("word/numbering.xml", numbering_xml(numbered_lists)),
-        ("word/footer1.xml", footer_xml()),
+        (
+            "word/footer1.xml",
+            banner_xml("w:ftr", &doc.shown_footer(), doc.page),
+        ),
+        (
+            "word/header1.xml",
+            banner_xml("w:hdr", &doc.header, doc.page),
+        ),
         ("word/document.xml", document),
     ]
     .into_iter()
@@ -273,6 +423,13 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
     let mut list_open = false;
     let mut start = 0;
     let mut previous: Option<Para> = None;
+    // Where the text each comment is about starts and ends.
+    let noted: HashMap<u16, Range<usize>> = (1..=doc.comments.len())
+        .filter_map(|note| {
+            let note = u16::try_from(note).ok()?;
+            Some((note, doc.noted(note)?))
+        })
+        .collect();
     for para in paras {
         let end = chars[start..]
             .iter()
@@ -319,8 +476,8 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
             &mut xml,
             *para,
             num,
-            &chars[start..end],
-            &formats[start..end],
+            (start, &chars[start..end], &formats[start..end]),
+            &noted,
             drawing,
         );
         start = (end + 1).min(chars.len());
@@ -332,11 +489,17 @@ fn document_xml(doc: &Document) -> (String, u32, Vec<u32>) {
         // Word wants a paragraph after a table.
         xml.push_str("<w:p/>");
     }
-    let footer = if doc.page_numbers {
-        format!(r#"<w:footerReference w:type="default" r:id="{FOOTER_REL}"/>"#)
-    } else {
-        String::new()
-    };
+    let mut footer = String::new();
+    if !doc.header.is_empty() {
+        footer.push_str(&format!(
+            r#"<w:headerReference w:type="default" r:id="{HEADER_REL}"/>"#
+        ));
+    }
+    if !doc.shown_footer().is_empty() {
+        footer.push_str(&format!(
+            r#"<w:footerReference w:type="default" r:id="{FOOTER_REL}"/>"#
+        ));
+    }
     xml.push_str(&format!(
         "<w:sectPr>{footer}{}</w:sectPr></w:body></w:document>",
         page_setup_xml(doc.page)
@@ -363,12 +526,7 @@ fn table_tags(xml: &mut String, from: Option<Cell>, to: Option<Cell>, doc: &Docu
     let Some(cell) = to else {
         return;
     };
-    let columns = doc.paras()[doc.table_paras(cell.table)]
-        .iter()
-        .filter_map(|para| para.cell)
-        .map(|cell| u32::from(cell.col) + 1)
-        .max()
-        .unwrap_or(1);
+    let columns = u32::from(doc.table_size(cell.table).1).max(1);
     let table_width = content_width(doc.page);
     let width = table_width / columns;
     if !same_table {
@@ -387,8 +545,16 @@ fn table_tags(xml: &mut String, from: Option<Cell>, to: Option<Cell>, doc: &Docu
     if !same_row {
         xml.push_str("<w:tr>");
     }
+    // A joined cell takes several columns of the grid.
+    let span = u32::from(doc.cell_span(cell));
+    let joined = if span > 1 {
+        format!(r#"<w:gridSpan w:val="{span}"/>"#)
+    } else {
+        String::new()
+    };
     xml.push_str(&format!(
-        r#"<w:tc><w:tcPr><w:tcW w:w="{width}" w:type="dxa"/></w:tcPr>"#
+        r#"<w:tc><w:tcPr><w:tcW w:w="{}" w:type="dxa"/>{joined}</w:tcPr>"#,
+        width * span
     ));
 }
 
@@ -396,11 +562,32 @@ fn paragraph_xml(
     xml: &mut String,
     para: Para,
     num: Option<(u32, u32)>,
-    chars: &[char],
-    formats: &[Format],
+    (offset, chars, formats): (usize, &[char], &[Format]),
+    noted: &HashMap<u16, Range<usize>>,
     drawing: Option<String>,
 ) {
-    if let Some(drawing) = drawing {
+    // A picture beside the text floats in the paragraph of that text.
+    let mut beside = String::new();
+    if let Some(drawing) = drawing.as_ref().filter(|_| para.wrap != Wrap::Above) {
+        let side = if para.wrap == Wrap::Right {
+            "right"
+        } else {
+            "left"
+        };
+        let anchor = format!(
+            r#"<wp:anchor distT="0" distB="0" distL="114300" distR="114300" simplePos="0" relativeHeight="251658240" behindDoc="0" locked="0" layoutInCell="1" allowOverlap="1"><wp:simplePos x="0" y="0"/><wp:positionH relativeFrom="column"><wp:align>{side}</wp:align></wp:positionH><wp:positionV relativeFrom="paragraph"><wp:posOffset>0</wp:posOffset></wp:positionV>"#
+        );
+        beside = drawing
+            .replace(
+                r#"<wp:inline distT="0" distB="0" distL="0" distR="0">"#,
+                &anchor,
+            )
+            .replace(
+                "<wp:docPr",
+                r#"<wp:wrapSquare wrapText="bothSides"/><wp:docPr"#,
+            )
+            .replace("</wp:inline>", "</wp:anchor>");
+    } else if let Some(drawing) = &drawing {
         // The picture gets a paragraph of its own; its caption, if any, follows.
         let props = para_props(para, num);
         xml.push_str(&format!("<w:p>{props}{drawing}</w:p>"));
@@ -409,29 +596,64 @@ fn paragraph_xml(
         }
     }
     let para = Para {
-        page_break: para.page_break && para.picture.is_none(),
+        page_break: para.page_break && (para.picture.is_none() || !beside.is_empty()),
         ..para
     };
     xml.push_str("<w:p>");
     xml.push_str(&para_props(para, num));
+    xml.push_str(&beside);
     let mut start = 0;
     for run in formats.chunk_by(|a, b| a == b) {
         let text = &chars[start..start + run.len()];
+        // Where the run is in the whole text.
+        let place = offset + start..offset + start + run.len();
         start += run.len();
+        let look = run[0];
+        let about = noted.get(&look.note).filter(|_| look.note != 0);
+        if about.is_some_and(|about| about.start == place.start) {
+            let id = look.note - 1;
+            xml.push_str(&format!(r#"<w:commentRangeStart w:id="{id}"/>"#));
+        }
+        if look.link != 0 {
+            let id = link_rel(look.link);
+            xml.push_str(&format!(r#"<w:hyperlink r:id="{id}" w:history="1">"#));
+        }
+        // A tracked change wraps its run; what was taken out is written as such.
+        let (wrap, letters) = match look.change {
+            Change::None => (None, "w:t"),
+            Change::Inserted => (Some("w:ins"), "w:t"),
+            Change::Deleted => (Some("w:del"), "w:delText"),
+        };
+        if let Some(wrap) = wrap {
+            let id = place.start;
+            xml.push_str(&format!(r#"<{wrap} w:id="{id}" w:author="GodDoc">"#));
+        }
         // The style may be bold: say so when the run is not.
-        let props = run_props(&run[0], para.kind.format().bold);
+        let props = run_props(&look, para.kind.format().bold);
         xml.push_str(&format!("<w:r><w:rPr>{props}</w:rPr>"));
         for (index, piece) in text.split(|ch| *ch == '\t').enumerate() {
             if index > 0 {
                 xml.push_str("<w:tab/>");
             }
             if !piece.is_empty() {
-                xml.push_str(r#"<w:t xml:space="preserve">"#);
+                xml.push_str(&format!(r#"<{letters} xml:space="preserve">"#));
                 piece.iter().for_each(|ch| push_escaped(xml, *ch));
-                xml.push_str("</w:t>");
+                xml.push_str(&format!("</{letters}>"));
             }
         }
         xml.push_str("</w:r>");
+        if let Some(wrap) = wrap {
+            xml.push_str(&format!("</{wrap}>"));
+        }
+        if look.link != 0 {
+            xml.push_str("</w:hyperlink>");
+        }
+        if about.is_some_and(|about| about.end == place.end) {
+            let id = look.note - 1;
+            xml.push_str(&format!(
+                r#"<w:commentRangeEnd w:id="{id}"/><w:r><w:commentReference w:id="{id}"/></w:r>"#
+            ));
+        }
     }
     xml.push_str("</w:p>");
 }
@@ -455,17 +677,28 @@ fn para_props(para: Para, num: Option<(u32, u32)>) -> String {
             r#"<w:pBdr><w:bottom w:val="single" w:sz="6" w:space="1" w:color="000000"/></w:pBdr>"#,
         );
     }
-    if para.spacing != Spacing::Single {
-        // 240 is single spacing.
-        let line = (240.0 * para.spacing.factor()) as u32;
+    // 240 is single spacing.
+    let line = (240.0 * para.line_factor()).round() as u32;
+    if line != 240 || para.before > 0 || para.after > 0 {
+        let (before, after) = (para.before, para.after);
         xml.push_str(&format!(
-            r#"<w:spacing w:line="{line}" w:lineRule="auto"/>"#
+            r#"<w:spacing w:before="{before}" w:after="{after}" w:line="{line}" w:lineRule="auto"/>"#
         ));
     }
-    // A list item is indented by its level in the list.
-    if para.indent > 0 && num.is_none() {
-        let left = u32::from(para.indent) * INDENT_STEP;
-        xml.push_str(&format!(r#"<w:ind w:left="{left}"/>"#));
+    // A list item is indented by its level in the list. Word counts the left indent up to
+    // the lines after the first: a hanging first line starts that much before it.
+    let hanging = u32::from(para.first_line.min(0).unsigned_abs());
+    let left = u32::from(para.indent) * INDENT_STEP + u32::from(para.left) + hanging;
+    if num.is_none() && (left > 0 || para.right > 0 || para.first_line != 0) {
+        let first = match para.first_line {
+            0 => String::new(),
+            first if first > 0 => format!(r#" w:firstLine="{first}""#),
+            _ => format!(r#" w:hanging="{hanging}""#),
+        };
+        let right = para.right;
+        xml.push_str(&format!(
+            r#"<w:ind w:left="{left}" w:right="{right}"{first}/>"#
+        ));
     }
     let align = match para.align {
         Align::Left => None,
@@ -565,6 +798,24 @@ pub fn read(bytes: &[u8]) -> Result<Document> {
     // Relationship id -> image file.
     let mut media = HashMap::new();
     let rels = part("word/_rels/document.xml.rels").unwrap_or_default();
+    let comments = part("word/comments.xml")
+        .map(|xml| read_comments(&xml))
+        .unwrap_or_default();
+    // The header and the footer of ordinary pages, from the parts the document names.
+    let named = relationships(&rels);
+    let mut banner = |tag: &str| {
+        let id = default_reference(&document, tag)?;
+        let (_, target) = named.iter().find(|(named, _)| *named == id)?;
+        let xml = part(&format!("word/{}", target.trim_start_matches('/'))).ok()?;
+        Some(read_banner(&xml))
+    };
+    let header = banner("<w:headerReference").unwrap_or_default();
+    // Where links lead, and what the comments say, for the text that refers to them.
+    let marks = Marks {
+        targets: relationships(&rels).into_iter().collect(),
+        comments,
+    };
+    let footer = banner("<w:footerReference").unwrap_or_default();
     for (id, target) in relationships(&rels) {
         let kind = target
             .rsplit_once('.')
@@ -580,9 +831,127 @@ pub fn read(bytes: &[u8]) -> Result<Document> {
             );
         }
     }
-    let mut doc = parse(&document, lists, styles, media)?;
-    doc.page_numbers = page_numbers;
+    let mut doc = parse(&document, lists, styles, media, marks)?;
+    doc.header = header;
+    let number_alone =
+        footer.center == Banner::PAGE && footer.left.is_empty() && footer.right.is_empty();
+    let placed = footer
+        .zones()
+        .iter()
+        .any(|zone| zone.contains(Banner::PAGE));
+    // A page number alone in the middle is what "page numbers" writes.
+    (doc.footer, doc.page_numbers) = match (number_alone, placed) {
+        (true, _) => (Banner::default(), true),
+        (false, true) => (footer, false),
+        (false, false) => (footer, page_numbers),
+    };
     Ok(doc)
+}
+
+/// Id of the relationship `tag` (as `<w:headerReference`) gives for ordinary pages: not the
+/// one of the first page alone, nor of even pages.
+fn default_reference(document: &str, tag: &str) -> Option<String> {
+    document.match_indices(tag).find_map(|(at, _)| {
+        let end = document[at..].find('>')?;
+        let found = &document[at..at + end];
+        let id = found.split("r:id=\"").nth(1)?.split('"').next()?;
+        let ordinary = !found.contains("w:type=\"first\"") && !found.contains("w:type=\"even\"");
+        ordinary.then(|| id.to_owned())
+    })
+}
+
+/// What a header or footer part says: its first written paragraph, cut at its tabs into
+/// left, middle and right. Page fields become [`Banner::PAGE`] and [`Banner::PAGES`].
+fn read_banner(xml: &str) -> Banner {
+    let mut reader = Reader::from_str(xml);
+    let mut zones = vec![String::new()];
+    let mut align: Option<String> = None;
+    // In paragraph properties, in a text, in the code of a field, in what a field shows.
+    let (mut in_props, mut in_text, mut in_code, mut in_result) = (false, false, false, false);
+    let token = |code: &str| {
+        if code.contains("NUMPAGES") {
+            Banner::PAGES
+        } else if code.contains("PAGE") {
+            Banner::PAGE
+        } else {
+            ""
+        }
+    };
+    while let Ok(event) = reader.read_event() {
+        let opens = matches!(event, Event::Start(_));
+        match &event {
+            Event::Eof => break,
+            Event::Start(tag) | Event::Empty(tag) => match tag.name().as_ref() {
+                b"w:pPr" => in_props = opens,
+                b"w:jc" => align = attr(tag, b"w:val").map(Cow::into_owned),
+                // A tab among the properties is a tab stop, not a tab.
+                b"w:tab" | b"w:ptab" if !in_props => zones.push(String::new()),
+                b"w:t" => in_text = opens,
+                b"w:instrText" => in_code = opens,
+                b"w:fldChar" => match attr(tag, b"w:fldCharType").as_deref() {
+                    Some("separate") => in_result = true,
+                    Some("end") => in_result = false,
+                    _ => {}
+                },
+                b"w:fldSimple" => {
+                    let code = attr(tag, b"w:instr").unwrap_or_default();
+                    if let Some(zone) = zones.last_mut() {
+                        zone.push_str(token(&code));
+                    }
+                    in_result = opens;
+                }
+                _ => {}
+            },
+            Event::End(tag) => match tag.name().as_ref() {
+                b"w:pPr" => in_props = false,
+                b"w:t" => in_text = false,
+                b"w:instrText" => in_code = false,
+                b"w:fldSimple" => in_result = false,
+                b"w:p" => {
+                    if zones.iter().any(|zone| !zone.trim().is_empty()) {
+                        break;
+                    }
+                    (zones, align) = (vec![String::new()], None);
+                }
+                _ => {}
+            },
+            Event::Text(text) => {
+                let text = text.unescape().unwrap_or_default();
+                let Some(zone) = zones.last_mut() else {
+                    continue;
+                };
+                if in_code {
+                    zone.push_str(token(&text));
+                } else if in_text && !in_result {
+                    zone.push_str(&text);
+                }
+            }
+            _ => {}
+        }
+    }
+    let mut zones = zones.into_iter().map(|zone| zone.trim().to_owned());
+    let (first, second) = (zones.next().unwrap_or_default(), zones.next());
+    let rest: Vec<String> = zones.collect();
+    match (second, align.as_deref()) {
+        // One stretch of text: where its paragraph puts it.
+        (None, Some("center")) => Banner {
+            center: first,
+            ..Banner::default()
+        },
+        (None, Some("right" | "end")) => Banner {
+            right: first,
+            ..Banner::default()
+        },
+        (None, _) => Banner {
+            left: first,
+            ..Banner::default()
+        },
+        (Some(center), _) => Banner {
+            left: first,
+            center,
+            right: rest.join(" "),
+        },
+    }
 }
 
 /// (id, target) of every relationship in a `.rels` part.
@@ -826,6 +1195,26 @@ struct Parser {
     /// Inside the borders of a paragraph (`w:pBdr`).
     in_borders: bool,
     page: PageSetup,
+    marks: Marks,
+    /// Where the links met so far lead.
+    links: Vec<String>,
+    /// Columns the table cell being read takes.
+    span: u8,
+    /// The drawing being read floats beside the text, on this side; its side is being read.
+    floating: Option<Wrap>,
+    in_align: bool,
+    /// The link, the tracked change and the comments the text being read is in.
+    link: u16,
+    change: Change,
+    notes: Vec<String>,
+}
+
+/// What the text of a document refers to by an id: where its links lead, what its comments
+/// say.
+#[derive(Default)]
+struct Marks {
+    targets: HashMap<String, String>,
+    comments: Vec<(String, Comment)>,
 }
 
 fn parse(
@@ -833,12 +1222,14 @@ fn parse(
     lists: Lists,
     styles: Styles,
     media: HashMap<String, Image>,
+    marks: Marks,
 ) -> Result<Document> {
     let mut reader = Reader::from_str(xml);
     let mut parser = Parser {
         lists,
         styles: Rc::new(styles),
         media,
+        marks,
         ..Parser::default()
     };
     loop {
@@ -849,6 +1240,13 @@ fn parse(
                 parser.close(tag.name().as_ref());
             }
             Ok(Event::End(tag)) => parser.close(tag.name().as_ref()),
+            Ok(Event::Text(text)) if parser.in_align => {
+                if text.unescape().is_ok_and(|side| side.trim() == "right")
+                    && parser.floating.is_some()
+                {
+                    parser.floating = Some(Wrap::Right);
+                }
+            }
             Ok(Event::Text(text)) if parser.in_text => {
                 let text = text
                     .unescape()
@@ -870,6 +1268,15 @@ fn parse(
         images: parser.images,
         page_numbers: false,
         page: parser.page,
+        header: Banner::default(),
+        footer: Banner::default(),
+        links: parser.links,
+        comments: parser
+            .marks
+            .comments
+            .into_iter()
+            .map(|(_, comment)| comment)
+            .collect(),
     })
 }
 
@@ -902,6 +1309,18 @@ fn font_of(family: &str) -> Font {
         ("georgia", Font::Georgia),
         ("tahoma", Font::Tahoma),
         ("comic", Font::Comic),
+        ("segoe", Font::SegoeUi),
+        ("consolas", Font::Consolas),
+        ("trebuchet", Font::Trebuchet),
+        ("cambria", Font::Cambria),
+        ("candara", Font::Candara),
+        ("constantia", Font::Constantia),
+        ("corbel", Font::Corbel),
+        ("palatino", Font::Palatino),
+        ("garamond", Font::Garamond),
+        ("century gothic", Font::CenturyGothic),
+        ("book antiqua", Font::BookAntiqua),
+        ("impact", Font::Impact),
     ];
     if let Some((_, font)) = named.iter().find(|(name, _)| family.contains(name)) {
         *font
@@ -1005,7 +1424,21 @@ impl Parser {
         }
         self.para();
         self.text.push(ch);
-        self.formats.push(self.run);
+        // The comment it is about: the last one opened, by its place among the comments.
+        let note = self.notes.last().and_then(|id| {
+            let place = self
+                .marks
+                .comments
+                .iter()
+                .position(|(named, _)| named == id)?;
+            u16::try_from(place + 1).ok()
+        });
+        self.formats.push(Format {
+            link: self.link,
+            change: self.change,
+            note: note.unwrap_or(0),
+            ..self.run
+        });
         self.has_text = true;
     }
 
@@ -1038,6 +1471,7 @@ impl Parser {
             width,
             height,
         });
+        self.para().wrap = self.floating.unwrap_or_default();
     }
 
     /// Start a paragraph styled `para` after the current one.
@@ -1046,8 +1480,14 @@ impl Parser {
             self.text.push('\n');
             self.formats.push(Format::default());
         }
+        let cell = self.cell();
         self.paras.push(Para {
-            cell: self.cell(),
+            cell,
+            span: if cell.is_some() && self.span > 1 {
+                self.span
+            } else {
+                0
+            },
             ..para
         });
         self.has_text = false;
@@ -1066,8 +1506,44 @@ impl Parser {
             b"w:tr" if self.table_depth == 1 => {
                 self.row += 1;
                 self.col = -1;
+                self.span = 1;
             }
-            b"w:tc" if self.table_depth == 1 => self.col += 1,
+            // A cell starts after the columns the one before it took.
+            b"w:tc" if self.table_depth == 1 => {
+                self.col += i32::from(self.span.max(1));
+                self.span = 1;
+            }
+            b"w:gridSpan" if self.table_depth == 1 => {
+                let span = attr(tag, b"w:val").and_then(|span| span.parse::<u8>().ok());
+                self.span = span.unwrap_or(1).max(1);
+            }
+            b"wp:anchor" => self.floating = Some(Wrap::Left),
+            b"wp:align" => self.in_align = true,
+            b"w:hyperlink" => {
+                let target =
+                    attr(tag, b"r:id").and_then(|id| self.marks.targets.get(&*id).cloned());
+                self.link = target.map_or(0, |target| {
+                    let place = self.links.iter().position(|link| *link == target);
+                    let place = place.unwrap_or_else(|| {
+                        self.links.push(target);
+                        self.links.len() - 1
+                    });
+                    u16::try_from(place + 1).unwrap_or(0)
+                });
+            }
+            b"w:ins" => self.change = Change::Inserted,
+            b"w:del" => self.change = Change::Deleted,
+            b"w:delText" => self.in_text = true,
+            b"w:commentRangeStart" => {
+                if let Some(id) = attr(tag, b"w:id") {
+                    self.notes.push(id.into_owned());
+                }
+            }
+            b"w:commentRangeEnd" => {
+                if let Some(id) = attr(tag, b"w:id") {
+                    self.notes.retain(|open| *open != *id);
+                }
+            }
             b"w:p" => {
                 self.break_paragraph(Para::default());
                 self.use_style(None);
@@ -1082,37 +1558,75 @@ impl Parser {
             b"w:bottom" if self.in_borders => self.para().rule = is_on(tag),
             // Line spacing of the paragraph (runs have a `w:spacing` of their own).
             b"w:spacing" if !self.in_run => {
-                if let Some(line) = attr(tag, b"w:line").and_then(|line| line.parse::<f32>().ok()) {
-                    self.para().spacing = match line {
-                        line if line >= 440.0 => Spacing::Double,
-                        line if line >= 330.0 => Spacing::OneAndHalf,
-                        _ => Spacing::Single,
-                    };
+                let twips = |name: &[u8]| attr(tag, name).and_then(|side| side.parse::<f32>().ok());
+                let measure = |twips: f32| twips.clamp(0.0, f32::from(u16::MAX)) as u16;
+                if let Some(before) = twips(b"w:before") {
+                    self.para().before = measure(before);
+                }
+                if let Some(after) = twips(b"w:after") {
+                    self.para().after = measure(after);
+                }
+                // A height in points ("exact", "atLeast") is not a number of lines.
+                let lines = attr(tag, b"w:lineRule").is_none_or(|rule| rule == "auto");
+                if let Some(line) = twips(b"w:line").filter(|_| lines) {
+                    self.para().set_line(measure((line / 2.4).round()));
                 }
             }
             // A list item is indented by its level, not by what its indent measures.
             b"w:ind" if !self.in_run && self.para().list == List::None => {
-                let left = attr(tag, b"w:left").or_else(|| attr(tag, b"w:start"));
-                if let Some(left) = left.and_then(|left| left.parse::<f32>().ok()) {
-                    let level = (left / INDENT_STEP as f32)
-                        .round()
-                        .clamp(0.0, f32::from(MAX_INDENT));
-                    self.para().indent = level as u8;
+                let twips = |name: &[u8]| attr(tag, name).and_then(|side| side.parse::<f32>().ok());
+                let measure = |twips: f32| twips.clamp(0.0, f32::from(u16::MAX)) as u16;
+                let hanging = twips(b"w:hanging").unwrap_or(0.0).max(0.0);
+                if let Some(left) = twips(b"w:left").or_else(|| twips(b"w:start")) {
+                    // Word counts the left indent up to the lines after the first.
+                    let left = (left - hanging).max(0.0);
+                    let step = INDENT_STEP as f32;
+                    let level = (left / step).round();
+                    // A whole number of steps is an indent level; anything else, a measure.
+                    let stepped =
+                        (left - level * step).abs() < 1.0 && level <= f32::from(MAX_INDENT);
+                    let para = self.para();
+                    (para.indent, para.left) = if stepped {
+                        (level as u8, 0)
+                    } else {
+                        (0, measure(left))
+                    };
                 }
+                if let Some(right) = twips(b"w:right").or_else(|| twips(b"w:end")) {
+                    self.para().right = measure(right);
+                }
+                let first = twips(b"w:firstLine").unwrap_or(0.0);
+                let limit = f32::from(i16::MAX);
+                self.para().first_line = if hanging > 0.0 {
+                    -(hanging.min(limit) as i16)
+                } else {
+                    first.clamp(0.0, limit) as i16
+                };
+            }
+            b"w:cols" => {
+                let count = attr(tag, b"w:num").and_then(|count| count.parse::<u8>().ok());
+                self.page.columns = count.filter(|count| *count > 1).unwrap_or(0).min(4);
             }
             b"w:pgSz" => {
                 let side = |name: &[u8]| attr(tag, name).and_then(|side| side.parse::<f32>().ok());
                 if let (Some(width), Some(height)) = (side(b"w:w"), side(b"w:h")) {
                     self.page.landscape = width > height;
+                    self.page.paper = Paper::closest(width / TWIPS, height / TWIPS);
                 }
             }
             b"w:pgMar" => {
-                if let Some(left) = attr(tag, b"w:left").and_then(|left| left.parse::<f32>().ok()) {
-                    self.page.margins = match left / TWIPS {
-                        points if points <= 54.0 => Margins::Narrow,
-                        points if points >= 90.0 => Margins::Wide,
-                        _ => Margins::Normal,
-                    };
+                let side = |name: &[u8]| {
+                    let twips = attr(tag, name).and_then(|side| side.parse::<f32>().ok());
+                    twips.map(|twips| twips.clamp(0.0, f32::from(u16::MAX)) as u16)
+                };
+                let sides = [
+                    side(b"w:top"),
+                    side(b"w:right"),
+                    side(b"w:bottom"),
+                    side(b"w:left"),
+                ];
+                if let [Some(top), Some(right), Some(bottom), Some(left)] = sides {
+                    self.page.set_margins([top, right, bottom, left]);
                 }
             }
             b"w:ilvl" if !self.in_run => {
@@ -1199,6 +1713,7 @@ impl Parser {
         *para = Para {
             kind,
             cell: para.cell,
+            span: para.span,
             page_break: para.page_break,
             picture: para.picture,
             ..Para::default()
@@ -1214,7 +1729,11 @@ impl Parser {
         match name {
             b"w:r" => self.in_run = false,
             b"w:rPr" => self.in_run_props = false,
-            b"w:t" => self.in_text = false,
+            b"w:t" | b"w:delText" => self.in_text = false,
+            b"w:hyperlink" => self.link = 0,
+            b"wp:anchor" => self.floating = None,
+            b"wp:align" => self.in_align = false,
+            b"w:ins" | b"w:del" => self.change = Change::None,
             b"w:tbl" => self.table_depth = self.table_depth.saturating_sub(1),
             b"w:pBdr" => self.in_borders = false,
             _ => {}
@@ -1225,6 +1744,7 @@ impl Parser {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::{Margins, Spacing};
 
     /// Formats of everything but line breaks, which carry none in a .docx.
     fn visible(doc: &Document) -> Vec<Format> {
@@ -1332,8 +1852,11 @@ mod tests {
         });
         doc.insert_table(0, 1, 2).unwrap();
         doc.page = PageSetup {
+            paper: Paper::Letter,
             landscape: true,
             margins: Margins::Narrow,
+            custom: None,
+            columns: 2,
         };
 
         let back = read(&write(&doc).unwrap()).unwrap();
@@ -1357,7 +1880,14 @@ mod tests {
             <w:p><w:pPr><w:numPr><w:numId w:val="7"/></w:numPr></w:pPr><w:r><w:t>item</w:t></w:r></w:p>
             </w:body></w:document>"#;
         let lists = HashMap::from([("7".to_owned(), vec![List::Number])]);
-        let doc = parse(xml, lists, Styles::default(), HashMap::new()).unwrap();
+        let doc = parse(
+            xml,
+            lists,
+            Styles::default(),
+            HashMap::new(),
+            Marks::default(),
+        )
+        .unwrap();
         assert_eq!(doc.text(), "A & B\n\none\ntwo\nthree\na\nb\n\nitem");
         assert_eq!(doc.paras()[0].kind, Kind::Heading2);
         assert_eq!(doc.paras()[0].align, Align::Center);
@@ -1390,6 +1920,182 @@ mod tests {
     }
 
     #[test]
+    fn measures_of_paragraphs_and_margins_come_back_from_a_file() {
+        let mut doc = Document::default();
+        doc.replace(
+            0..0,
+            "one
+two
+three",
+            Format::default(),
+        );
+        doc.edit_paras(0..1, |para| {
+            (para.left, para.right, para.first_line) = (567, 284, 400);
+            (para.before, para.after) = (120, 240);
+            para.set_line(115);
+        });
+        // A hanging first line, and an indent that is no whole number of levels.
+        doc.edit_paras(1..2, |para| (para.left, para.first_line) = (300, -709));
+        doc.page.set_margins([1000, 1500, 1200, 2000]);
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.paras(), doc.paras());
+        assert_eq!(back.page, doc.page);
+        assert_eq!(back.page.margin_points(), [50.0, 75.0, 60.0, 100.0]);
+
+        // Four sides that are a named margin are that margin, and line spacings with a name
+        // keep it.
+        let mut page = PageSetup::default();
+        page.set_margins([720; 4]);
+        assert_eq!((page.margins, page.custom), (Margins::Narrow, None));
+        let mut para = Para::default();
+        para.set_line(150);
+        assert_eq!((para.spacing, para.line), (Spacing::OneAndHalf, 0));
+        para.set_line(115);
+        assert_eq!((para.line, para.line_factor()), (115, 1.15));
+    }
+
+    #[test]
+    fn headers_and_footers_come_back_from_a_file() {
+        let mut doc = Document::default();
+        doc.replace(0..0, "text", Format::default());
+        doc.header = Banner {
+            left: "Report & notes".into(),
+            center: String::new(),
+            right: "Spring <edition>".into(),
+        };
+        doc.footer = Banner {
+            left: "GodDoc".into(),
+            center: String::new(),
+            right: "Page {page} of {pages}".into(),
+        };
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!((&back.header, &back.footer), (&doc.header, &doc.footer));
+        assert!(!back.page_numbers);
+        assert_eq!(Banner::on_page(&back.footer.right, 2, 5), "Page 2 of 5");
+
+        // Page numbers alone are still only that, and join a footer that does not place them.
+        let mut doc = Document {
+            page_numbers: true,
+            ..Document::default()
+        };
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert!(back.page_numbers && back.footer.is_empty() && back.header.is_empty());
+        doc.footer.center = "Draft".into();
+        assert_eq!(doc.shown_footer().center, "Draft {page}");
+
+        // A header written by Word: one centred paragraph, a field written the short way.
+        let word = r#"<w:hdr xmlns:w="x"><w:p><w:pPr><w:jc w:val="center"/></w:pPr><w:r><w:t>Page </w:t></w:r><w:fldSimple w:instr=" PAGE "><w:r><w:t>7</w:t></w:r></w:fldSimple></w:p></w:hdr>"#;
+        assert_eq!(read_banner(word).center, "Page {page}");
+    }
+
+    #[test]
+    fn links_comments_and_tracked_changes_come_back_from_a_file() {
+        let mut doc = Document::default();
+        doc.replace(
+            0..0,
+            "See the site, a note here\nand old new text",
+            Format::default(),
+        );
+        let link = doc.link_to("https://example.org/?a=1&b=\"2\"");
+        doc.restyle(8..12, |format| format.link = link);
+        // A comment about words of two paragraphs.
+        let note = doc.add_comment(Comment {
+            author: "Ada".into(),
+            text: "Is this <right>?".into(),
+        });
+        doc.restyle(16..29, |format| format.note = note);
+        doc.restyle(30..34, |format| format.change = Change::Deleted);
+        doc.restyle(34..38, |format| format.change = Change::Inserted);
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(back.text(), doc.text());
+        assert_eq!(visible(&back), visible(&doc));
+        assert_eq!((&back.links, &back.comments), (&doc.links, &doc.comments));
+        assert_eq!(
+            back.link(back.format_at(9).link),
+            Some("https://example.org/?a=1&b=\"2\"")
+        );
+        assert_eq!(back.noted(note), Some(16..29));
+
+        // Accepting keeps what was put in and drops what was taken out; rejecting, the reverse.
+        let mut accepted = back.clone();
+        accepted.settle_changes(0..accepted.len(), true);
+        assert!(accepted.text().ends_with("and new text"));
+        let mut rejected = back;
+        rejected.settle_changes(0..rejected.len(), false);
+        assert!(rejected.text().ends_with("and old text"));
+        let settled = |doc: &Document| {
+            doc.formats()
+                .iter()
+                .all(|format| format.change == Change::None)
+        };
+        assert!(settled(&accepted) && settled(&rejected));
+    }
+
+    #[test]
+    fn joined_cells_come_back_from_a_file() {
+        let mut doc = Document::default();
+        doc.insert_table(0, 2, 3).unwrap();
+        let first = doc.paras().iter().find_map(|para| para.cell).unwrap();
+        assert!(doc.merge_cell_right(first));
+        assert_eq!(
+            (doc.cell_span(first), doc.table_size(first.table)),
+            (2, (2, 3))
+        );
+        let cols = |doc: &Document| -> Vec<(u16, u16, u8)> {
+            let cells = doc
+                .paras()
+                .iter()
+                .filter_map(|para| Some((para.cell?, para.span)));
+            cells
+                .map(|(cell, span)| (cell.row, cell.col, span))
+                .collect()
+        };
+        // The first row: one cell of two columns (its two paragraphs), then the third column.
+        assert_eq!(cols(&doc)[..3], [(0, 0, 2), (0, 0, 2), (0, 2, 0)]);
+        let back = read(&write(&doc).unwrap()).unwrap();
+        assert_eq!(cols(&back), cols(&doc));
+        assert!(back.has_joined_cells(first.table));
+
+        // Split, the row has its three cells again; a third cell cannot be joined twice.
+        assert!(doc.merge_cell_right(first) && !doc.merge_cell_right(first));
+        assert!(doc.split_cell(first) && !doc.split_cell(first));
+        let row: Vec<u16> = cols(&doc)
+            .iter()
+            .filter(|cell| cell.0 == 0)
+            .map(|cell| cell.1)
+            .collect();
+        assert_eq!(row, [0, 0, 0, 1, 2]);
+    }
+
+    #[test]
+    fn a_picture_beside_its_text_comes_back_from_a_file() {
+        let image = Image {
+            bytes: vec![0x89, b'P', b'N', b'G', 1, 2, 3].into(),
+            kind: ImageKind::Png,
+        };
+        for wrap in [Wrap::Left, Wrap::Right] {
+            let mut doc = Document::default();
+            doc.replace(
+                0..0,
+                "intro
+text beside the picture
+outro",
+                Format::default(),
+            );
+            doc.insert_image(8, image.clone(), 200, 120);
+            let para = doc
+                .paras()
+                .iter()
+                .position(|para| para.picture.is_some())
+                .unwrap();
+            doc.edit_paras(para..para + 1, |para| para.wrap = wrap);
+            let back = read(&write(&doc).unwrap()).unwrap();
+            assert_eq!(back.text(), doc.text());
+            assert_eq!(back.paras(), doc.paras());
+        }
+    }
+
+    #[test]
     fn garbage_is_an_error() {
         assert!(matches!(read(b"not a zip"), Err(Error::NotDocx(_))));
     }
@@ -1400,6 +2106,35 @@ mod tests {
         assert_eq!(Kind::of_style("Titre3"), Kind::Heading3);
         assert_eq!(Kind::of_style("Title"), Kind::Title);
         assert_eq!(Kind::of_style("ListParagraph"), Kind::Normal);
+        assert_eq!(Kind::of_style("Subtitle"), Kind::Subtitle);
+        assert_eq!(Kind::of_style("Sous-titre"), Kind::Subtitle);
+        assert_eq!(Kind::of_style("Citation"), Kind::Quote);
+    }
+
+    #[test]
+    fn every_kind_and_every_font_comes_back_from_a_file() {
+        let lines: Vec<&str> = Kind::ALL.iter().map(|kind| kind.name()).collect();
+        let mut doc = Document::default();
+        doc.replace(
+            0..0,
+            &lines.join(
+                "
+",
+            ),
+            Format::default(),
+        );
+        for (index, kind) in Kind::ALL.into_iter().enumerate() {
+            doc.set_kind(index..index + 1, kind);
+        }
+        let back = read(&write(&doc).unwrap()).unwrap();
+        let kinds: Vec<Kind> = back.paras().iter().map(|para| para.kind).collect();
+        assert_eq!(kinds, Kind::ALL);
+        // A quote is slanted and grey, as its style says.
+        let quote = back.format_at(back.text().chars().count() - 1);
+        assert!(quote.italic && quote.color == Kind::Quote.format().color);
+        for font in Font::ALL {
+            assert_eq!(font_of(font.family()), font, "{}", font.family());
+        }
     }
 
     #[test]
@@ -1461,7 +2196,14 @@ mod tests {
             para("Chapitre", "Two"),
             para("Titre2", "Sub"),
         );
-        let doc = parse(&xml, lists, read_styles(WORD_STYLES), HashMap::new()).unwrap();
+        let doc = parse(
+            &xml,
+            lists,
+            read_styles(WORD_STYLES),
+            HashMap::new(),
+            Marks::default(),
+        )
+        .unwrap();
         let markers: Vec<String> = doc.markers().into_iter().flatten().collect();
         assert_eq!(markers, ["1.", "1.1.", "2.", "2.1.", "–"]);
         let kinds: Vec<Kind> = doc.paras().iter().map(|para| para.kind).collect();

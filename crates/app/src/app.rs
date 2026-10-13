@@ -11,8 +11,8 @@ use egui::{
     ScrollArea, Sense, Stroke, TextEdit, TextureHandle, TextureId, Ui, ViewportCommand, pos2, vec2,
 };
 use goddoc_core::{
-    Align as ParaAlign, Document, Font, Format, Image, ImageKind, Kind, List, MAX_INDENT, Margins,
-    Script, Spacing, docx,
+    Align as ParaAlign, Change, Comment, Document, Font, Format, Image, ImageKind, Kind, List,
+    MAX_INDENT, Margins, Paper, Script, Spacing, Wrap, docx,
 };
 
 use crate::theme::{self, Palette};
@@ -21,7 +21,39 @@ use crate::widgets::{self, icon, with_icon};
 use crate::{APP_NAME, branding, editor, layout, platform};
 
 const TAB_HEIGHT: f32 = 38.0;
-const BAR_HEIGHT: f32 = 62.0;
+const BAR_HEIGHT: f32 = 90.0;
+/// Height of a large ribbon button.
+const TOOL_HEIGHT: f32 = 54.0;
+/// Height of the tools of a ribbon group, and of its name under them.
+const GROUP_TOOLS: f32 = 60.0;
+const GROUP_NAME: f32 = 18.0;
+/// Font sizes offered, in points.
+const SIZES: [f32; 16] = [
+    8.0, 9.0, 10.0, 11.0, 12.0, 14.0, 16.0, 18.0, 20.0, 22.0, 24.0, 26.0, 28.0, 36.0, 48.0, 72.0,
+];
+/// Text colours to pick from: greys and deep colours, then bright ones.
+const TEXT_COLORS: [([u8; 3], &str); 20] = [
+    ([0x00, 0x00, 0x00], "Black"),
+    ([0x40, 0x40, 0x40], "Dark grey"),
+    ([0x7F, 0x7F, 0x7F], "Grey"),
+    ([0xBF, 0xBF, 0xBF], "Light grey"),
+    ([0xFF, 0xFF, 0xFF], "White"),
+    ([0x1F, 0x38, 0x64], "Navy"),
+    ([0x2F, 0x54, 0x96], "Steel blue"),
+    ([0x83, 0x3C, 0x0B], "Brown"),
+    ([0x38, 0x57, 0x23], "Dark green"),
+    ([0x7F, 0x60, 0x00], "Olive"),
+    ([0xC0, 0x00, 0x00], "Dark red"),
+    ([0xFF, 0x00, 0x00], "Red"),
+    ([0xFF, 0xC0, 0x00], "Orange"),
+    ([0xFF, 0xFF, 0x00], "Yellow"),
+    ([0x92, 0xD0, 0x50], "Light green"),
+    ([0x00, 0xB0, 0x50], "Green"),
+    ([0x00, 0xB0, 0xF0], "Light blue"),
+    ([0x00, 0x70, 0xC0], "Blue"),
+    ([0x00, 0x20, 0x60], "Dark blue"),
+    ([0x70, 0x30, 0xA0], "Purple"),
+];
 /// Height of the row of ribbon tabs.
 const RIBBON_TABS_HEIGHT: f32 = 30.0;
 /// Longest document name shown in a tab before "…".
@@ -113,6 +145,16 @@ enum Edit {
     Nest(bool),
     /// Show or hide the line under the paragraph.
     Rule,
+    /// Room left and right of the paragraphs, in twentieths of a point.
+    Left(u16),
+    Right(u16),
+    /// How far their first line starts right of the others (left when negative).
+    FirstLine(i16),
+    /// Room above and under them, in twentieths of a point.
+    Before(u16),
+    After(u16),
+    /// Height of their lines, in hundredths of single spacing.
+    Line(u16),
     ClearFormat,
     Case(Case),
 }
@@ -163,8 +205,47 @@ enum Cmd {
     TableCol(bool),
     /// Delete the caret's table row (true) or column.
     DeleteLine(bool),
+    /// Join the caret's table cell with the one at its right, or give a joined cell its cells back.
+    MergeCell,
+    SplitCell,
     Landscape(bool),
     PageMargins(Margins),
+    Paper(Paper),
+    /// How many columns the text runs in on each page.
+    Columns(u8),
+    /// Where the selected picture stands: above its text, or beside it.
+    Wrap(Wrap),
+    /// Each margin apart: top, right, bottom, left, in twentieths of a point.
+    Margins([u16; 4]),
+    /// Show or hide the measures of the paragraph, or those of the page.
+    ParagraphWindow,
+    PageWindow,
+    /// Show or hide what the header and the footer say.
+    BannerWindow,
+    /// Show or hide the address of a link, or what to say in a new comment.
+    LinkWindow,
+    CommentWindow,
+    /// Show or hide the comments, beside the document.
+    Comments,
+    /// Track the changes to the text, or stop.
+    Track,
+    /// Check the spelling as the text is written, or stop.
+    Spelling,
+    Language(crate::spell::Language),
+    /// Write the n-th suggestion in place of the misspelled word the caret is in.
+    Suggest(usize),
+    /// Leave that word alone from now on.
+    IgnoreWord,
+    /// Keep (true) or undo the tracked changes: those of the selection, or all of them.
+    Changes(bool),
+    /// An empty page after the caret.
+    BlankPage,
+    /// Show or hide the count of words.
+    WordCount,
+    /// Zoom so that the page fills the width of the window, or (true) shows whole.
+    Fit(bool),
+    /// Hide the tools to leave only the page, or bring them back.
+    Focus,
     InsertText(&'static str),
     InsertDate,
     /// Pick up the look of the selection, to give it to what is selected next.
@@ -174,6 +255,8 @@ enum Cmd {
     /// Insert a table of contents where the caret is.
     Contents,
     Export(Export),
+    /// Send the document to a printer.
+    Print,
     /// Open the find and replace bar.
     Find,
     CloseFind,
@@ -188,6 +271,8 @@ enum Cmd {
 enum Export {
     Markdown,
     Html,
+    /// Each page as its picture.
+    Pdf,
 }
 
 /// A table of contents just inserted, whose page numbers wait for the pages to be laid out
@@ -207,18 +292,22 @@ enum Ribbon {
     Home,
     Insert,
     Layout,
-    Table,
+    References,
+    Review,
     View,
+    Table,
 }
 
 impl Ribbon {
-    const ALL: [(Self, &str); 6] = [
+    const ALL: [(Self, &str); 8] = [
         (Self::File, "File"),
         (Self::Home, "Home"),
         (Self::Insert, "Insert"),
         (Self::Layout, "Layout"),
-        (Self::Table, "Table"),
+        (Self::References, "References"),
+        (Self::Review, "Review"),
         (Self::View, "View"),
+        (Self::Table, "Table"),
     ];
 }
 
@@ -259,6 +348,10 @@ struct DocTab {
     /// Format painter: the look picked up, and the selection it was picked from.
     painter: Option<(Format, Range<usize>)>,
     contents: Option<Contents>,
+    /// Changes to the text are tracked: what is put in and taken out stays marked.
+    tracking: bool,
+    /// What the text was like (a number made from it) when its spelling was last checked.
+    spelled: u64,
     view: editor::View,
 }
 
@@ -279,6 +372,8 @@ impl DocTab {
             para_pages: Vec::new(),
             painter: None,
             contents: None,
+            tracking: false,
+            spelled: 0,
             view: editor::View::default(),
         }
     }
@@ -342,7 +437,15 @@ impl DocTab {
                     .set_list(paras, if all { List::None } else { list });
                 return self.touched();
             }
-            Edit::Spacing(spacing) => return self.edit_paras(|para| para.spacing = spacing),
+            Edit::Spacing(spacing) => {
+                return self.edit_paras(|para| (para.spacing, para.line) = (spacing, 0));
+            }
+            Edit::Left(left) => return self.edit_paras(|para| para.left = left),
+            Edit::Right(right) => return self.edit_paras(|para| para.right = right),
+            Edit::FirstLine(first) => return self.edit_paras(|para| para.first_line = first),
+            Edit::Before(before) => return self.edit_paras(|para| para.before = before),
+            Edit::After(after) => return self.edit_paras(|para| para.after = after),
+            Edit::Line(line) => return self.edit_paras(|para| para.set_line(line)),
             Edit::Indent(by) => {
                 return self.edit_paras(|para| {
                     para.indent = para.indent.saturating_add_signed(by).min(MAX_INDENT);
@@ -632,6 +735,38 @@ pub struct GodApp {
     recent: Vec<PathBuf>,
     find: Find,
     ribbon: Ribbon,
+    /// The count of words is shown.
+    counting: bool,
+    /// The measures of the paragraph, and those of the page, are shown.
+    paragraph_open: bool,
+    page_open: bool,
+    /// The header and the footer are shown, to type them.
+    banner_open: bool,
+    /// What is typed in them now is one undo step.
+    banner_typing: bool,
+    /// The address of a link is shown, to type it.
+    link_open: bool,
+    link_url: String,
+    /// A new comment is being written.
+    comment_open: bool,
+    comment_text: String,
+    /// The comments are shown beside the document.
+    show_comments: bool,
+    /// Spelling is checked, in this language; its dictionary, once it is there.
+    spelling: bool,
+    language: crate::spell::Language,
+    spell: Option<crate::spell::Speller>,
+    spell_loading: Option<std::sync::mpsc::Receiver<Result<crate::spell::Speller, String>>>,
+    /// The misspelled word the caret is in, and other spellings for it.
+    suggested: Option<(Range<usize>, Vec<String>)>,
+    /// Only the page is shown, without the tools.
+    focus: bool,
+    /// Room the pages have in the window, for zooming to fit.
+    view_size: egui::Vec2,
+    /// The fonts of the app, to draw pages away from the window.
+    fonts: egui::FontDefinitions,
+    /// What a print or an export under way says when it is over.
+    working: Option<std::sync::mpsc::Receiver<Result<Option<String>, String>>>,
     /// Decoded pictures, by the address of their image's bytes; `None` when undecodable.
     textures: HashMap<usize, Option<TextureHandle>>,
 }
@@ -651,7 +786,7 @@ impl GodApp {
         egui_phosphor::add_to_fonts(&mut fonts, egui_phosphor::Variant::Regular);
         layout::install_fonts(&mut fonts);
         crate::updates::add_bold_font(&mut fonts);
-        cc.egui_ctx.set_fonts(fonts);
+        cc.egui_ctx.set_fonts(fonts.clone());
         let mut app = Self {
             updates: crate::updates::Updates::default(),
             tabs: Vec::new(),
@@ -669,6 +804,25 @@ impl GodApp {
             home: files.is_empty(),
             find: Find::default(),
             ribbon: Ribbon::default(),
+            fonts,
+            working: None,
+            counting: false,
+            paragraph_open: false,
+            page_open: false,
+            banner_open: false,
+            banner_typing: false,
+            link_open: false,
+            link_url: String::new(),
+            comment_open: false,
+            comment_text: String::new(),
+            show_comments: false,
+            spelling: false,
+            language: crate::spell::Language::default(),
+            spell: None,
+            spell_loading: None,
+            suggested: None,
+            focus: false,
+            view_size: egui::Vec2::ZERO,
             recent: get("recent")
                 .map(|list| {
                     list.lines()
@@ -940,6 +1094,34 @@ impl GodApp {
                     set_cursor(ctx, editor_id, &tab.selection);
                 }
             }
+            Cmd::MergeCell | Cmd::SplitCell => {
+                if let Some(cell) = tab.para().cell {
+                    let before = tab.doc.clone();
+                    let done = if matches!(cmd, Cmd::MergeCell) {
+                        tab.doc.merge_cell_right(cell)
+                    } else {
+                        tab.doc.split_cell(cell)
+                    };
+                    if done {
+                        tab.checkpoint(before);
+                        tab.touched();
+                    } else if matches!(cmd, Cmd::MergeCell) {
+                        self.toasts
+                            .error("There is no cell at its right to join it with");
+                    } else {
+                        self.toasts.error("This cell is not joined");
+                    }
+                }
+            }
+            Cmd::TableCol(_) | Cmd::DeleteLine(false)
+                if tab
+                    .para()
+                    .cell
+                    .is_some_and(|cell| tab.doc.has_joined_cells(cell.table)) =>
+            {
+                self.toasts
+                    .error("Split the joined cells of this table first");
+            }
             Cmd::TableCol(right) => {
                 if let Some(cell) = tab.para().cell {
                     tab.restructure(|doc| Some(doc.insert_table_col(cell, right)));
@@ -959,8 +1141,128 @@ impl GodApp {
             }
             Cmd::PageMargins(margins) => {
                 tab.checkpoint(tab.doc.clone());
+                tab.doc.page.custom = None;
                 tab.doc.page.margins = margins;
                 tab.touched();
+            }
+            Cmd::Margins(sides) => {
+                tab.checkpoint(tab.doc.clone());
+                tab.doc.page.set_margins(sides);
+                tab.touched();
+            }
+            Cmd::ParagraphWindow => self.paragraph_open = !self.paragraph_open,
+            Cmd::PageWindow => self.page_open = !self.page_open,
+            Cmd::BannerWindow => self.banner_open = !self.banner_open,
+            Cmd::LinkWindow => {
+                // The address of the link the caret is in, to change it.
+                let link = tab.current().link;
+                self.link_url = tab.doc.link(link).unwrap_or_default().to_owned();
+                self.link_open = true;
+                return;
+            }
+            Cmd::CommentWindow => {
+                if tab.selection.is_empty() {
+                    self.toasts
+                        .error("Select the words the comment is about first");
+                } else {
+                    self.comment_open = true;
+                    return;
+                }
+            }
+            Cmd::Comments => self.show_comments = !self.show_comments,
+            Cmd::Track => tab.tracking = !tab.tracking,
+            Cmd::Spelling => {
+                self.spelling = !self.spelling;
+                if self.spelling {
+                    self.load_spelling(ctx);
+                }
+            }
+            Cmd::Language(language) => {
+                (self.language, self.spell) = (language, None);
+                if self.spelling {
+                    self.load_spelling(ctx);
+                }
+            }
+            Cmd::Suggest(choice) => {
+                let picked = self.suggested.take();
+                if let Some((word, words)) = picked
+                    && let Some(right) = words.get(choice)
+                    && let Some(format) = tab.doc.formats().get(word.start).copied()
+                {
+                    tab.checkpoint(tab.doc.clone());
+                    tab.doc.replace(word.clone(), right, format);
+                    let caret = word.start + right.chars().count();
+                    tab.selection = caret..caret;
+                    tab.touched();
+                    set_cursor(ctx, editor_id, &tab.selection);
+                }
+            }
+            Cmd::IgnoreWord => {
+                if let (Some((word, _)), Some(speller)) =
+                    (self.suggested.take(), self.spell.as_mut())
+                {
+                    let letters = tab.doc.text().chars().skip(word.start).take(word.len());
+                    speller.ignore(&letters.collect::<String>());
+                    tab.spelled = 0;
+                }
+            }
+            Cmd::Changes(accept) => {
+                let all = 0..tab.doc.len();
+                let range = Some(tab.selection.clone()).filter(|range| !range.is_empty());
+                tab.checkpoint(tab.doc.clone());
+                tab.doc.settle_changes(range.unwrap_or(all), accept);
+                tab.selection =
+                    tab.selection.start.min(tab.doc.len())..tab.selection.start.min(tab.doc.len());
+                tab.touched();
+                set_cursor(ctx, editor_id, &tab.selection);
+            }
+            Cmd::Wrap(wrap) => match tab.view.selected_picture {
+                Some(para) => {
+                    tab.checkpoint(tab.doc.clone());
+                    tab.doc.edit_paras(para..para + 1, |para| para.wrap = wrap);
+                    tab.touched();
+                }
+                None => self.toasts.error("Click a picture first"),
+            },
+            Cmd::Columns(columns) => {
+                tab.checkpoint(tab.doc.clone());
+                tab.doc.page.columns = columns;
+                tab.touched();
+            }
+            Cmd::Paper(paper) => {
+                tab.checkpoint(tab.doc.clone());
+                tab.doc.page.paper = paper;
+                tab.touched();
+            }
+            Cmd::BlankPage => {
+                // A page of its own: a break before it and one after.
+                for _ in 0..2 {
+                    let at = tab.selection.start;
+                    if !tab.restructure(|doc| doc.insert_page_break(at)) {
+                        self.toasts.error("A blank page cannot go inside a table");
+                        break;
+                    }
+                }
+                set_cursor(ctx, editor_id, &tab.selection);
+            }
+            Cmd::WordCount => self.counting = !self.counting,
+            Cmd::Fit(whole) => {
+                let (width, height) = tab.doc.page.size();
+                let room = self.view_size - vec2(2.0 * editor::PAD + 16.0, 2.0 * editor::PAD);
+                let by_width = room.x / width;
+                let zoom = if whole {
+                    by_width.min(room.y / height)
+                } else {
+                    by_width
+                };
+                self.zoom = zoom.clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
+            }
+            Cmd::Focus => {
+                self.focus = !self.focus;
+                if self.focus {
+                    self.toasts
+                        .success("Only the page: Esc brings the tools back");
+                }
             }
             Cmd::InsertText(text) => tab.insert_text(ctx, text),
             Cmd::InsertDate => tab.insert_text(ctx, &today()),
@@ -978,15 +1280,23 @@ impl GodApp {
                 }
                 set_cursor(ctx, editor_id, &tab.selection);
             }
+            Cmd::Print => self.output(ctx, None),
+            Cmd::Export(Export::Pdf) => {
+                if let Some(path) = platform::pick_export(&tab.name, "PDF document", "pdf") {
+                    self.output(ctx, Some(path));
+                }
+            }
             Cmd::Export(export) => {
                 let (label, extension) = match export {
                     Export::Markdown => ("Markdown", "md"),
-                    Export::Html => ("Web page", "html"),
+                    Export::Html | Export::Pdf => ("Web page", "html"),
                 };
                 if let Some(path) = platform::pick_export(&tab.name, label, extension) {
                     let text = match export {
                         Export::Markdown => goddoc_core::export::markdown(&tab.doc),
-                        Export::Html => goddoc_core::export::html(&tab.doc, &tab.name),
+                        Export::Html | Export::Pdf => {
+                            goddoc_core::export::html(&tab.doc, &tab.name)
+                        }
                     };
                     match platform::write_atomic(&path, text.as_bytes()) {
                         Ok(()) => self
@@ -1056,12 +1366,35 @@ impl GodApp {
     fn shortcuts(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
         let ctrl = Modifiers::COMMAND;
         let shift = Modifiers::COMMAND | Modifiers::SHIFT;
+        let alt = Modifiers::COMMAND | Modifiers::ALT;
+        let size = self.tabs[self.active].current().size;
+        let resize = |by: f32| {
+            let size = (size + by).clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
+            Cmd::Edit(Edit::Size(size))
+        };
+        let kind = |kind: Kind| Cmd::Edit(Edit::Kind(kind));
+        let spacing = |spacing: Spacing| Cmd::Edit(Edit::Spacing(spacing));
+        // Esc leaves the page-only view.
+        if self.focus && ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.focus = false;
+        }
         // More specific (shifted) shortcuts first.
         let table = [
             (shift, Key::S, Cmd::SaveAs),
             (shift, Key::Z, Cmd::Redo),
+            (shift, Key::N, kind(Kind::Normal)),
+            (alt, Key::Num1, kind(Kind::Heading1)),
+            (alt, Key::Num2, kind(Kind::Heading2)),
+            (alt, Key::Num3, kind(Kind::Heading3)),
+            (ctrl, Key::Num1, spacing(Spacing::Single)),
+            (ctrl, Key::Num5, spacing(Spacing::OneAndHalf)),
+            (ctrl, Key::Num2, spacing(Spacing::Double)),
+            (ctrl, Key::CloseBracket, resize(1.0)),
+            (ctrl, Key::OpenBracket, resize(-1.0)),
             (ctrl, Key::N, Cmd::New),
             (ctrl, Key::O, Cmd::Open),
+            (ctrl, Key::K, Cmd::LinkWindow),
+            (ctrl, Key::P, Cmd::Print),
             (ctrl, Key::W, Cmd::CloseTab),
             (ctrl, Key::F, Cmd::Find),
             (ctrl, Key::H, Cmd::Find),
@@ -1221,199 +1554,283 @@ impl GodApp {
 
     fn format_bar(&self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
         let palette = Palette::of(ui);
+        let p = &palette;
         let tab = &self.tabs[self.active];
         let format = tab.current();
         let para = tab.doc.paras()[tab.doc.para_at(tab.selection.start)];
+        let edit = |edit: Edit| Cmd::Edit(edit);
         // In a bar that scrolls sideways the width on offer has no end: the tools then
         // take what they need.
         let wide = Some(ui.available_width()).filter(|wide| wide.is_finite());
         let row = vec2(wide.unwrap_or(0.0), BAR_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            ui.add_space(6.0);
-            let quick = [
-                (icon::CLIPBOARD, "Paste (Ctrl+V)", Cmd::Paste),
-                (icon::SCISSORS, "Cut (Ctrl+X)", Cmd::Cut),
-                (icon::COPY, "Copy (Ctrl+C)", Cmd::Copy),
-                (
-                    icon::MAGNIFYING_GLASS,
-                    "Find and replace (Ctrl+F)",
-                    Cmd::Find,
-                ),
-            ];
-            for (glyph, tip, cmd) in quick {
-                if widgets::icon_button(ui, glyph, tip).clicked() {
-                    clicked.push(cmd);
+            // A window too narrow scrolls the tools sideways: their names stay on one line.
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.add_space(4.0);
+            group(ui, p, "Undo", |ui| {
+                let undo = ui.add_enabled_ui(!tab.undo.is_empty(), |ui| {
+                    widgets::icon_button(ui, icon::ARROW_U_UP_LEFT, "Undo (Ctrl+Z)")
+                });
+                if undo.inner.clicked() {
+                    clicked.push(Cmd::Undo);
                 }
-            }
-            divider(ui, &palette);
-            let undo = ui.add_enabled_ui(!tab.undo.is_empty(), |ui| {
-                widgets::icon_button(ui, icon::ARROW_U_UP_LEFT, "Undo (Ctrl+Z)")
+                let redo = ui.add_enabled_ui(!tab.redo.is_empty(), |ui| {
+                    widgets::icon_button(ui, icon::ARROW_U_UP_RIGHT, "Redo (Ctrl+Y)")
+                });
+                if redo.inner.clicked() {
+                    clicked.push(Cmd::Redo);
+                }
             });
-            if undo.inner.clicked() {
-                clicked.push(Cmd::Undo);
-            }
-            let redo = ui.add_enabled_ui(!tab.redo.is_empty(), |ui| {
-                widgets::icon_button(ui, icon::ARROW_U_UP_RIGHT, "Redo (Ctrl+Y)")
+            group(ui, p, "Clipboard", |ui| {
+                ui.horizontal(|ui| {
+                    tool(ui, p, clicked, icon::CLIPBOARD, "Paste", false, Cmd::Paste);
+                    ui.vertical(|ui| {
+                        ui.spacing_mut().item_spacing.y = 1.0;
+                        let painter =
+                            "Format painter: click, then select the text that takes this look";
+                        let painting = tab.painter.is_some();
+                        let small = [
+                            (icon::SCISSORS, "Cut", "Cut (Ctrl+X)", false, Cmd::Cut),
+                            (icon::COPY, "Copy", "Copy (Ctrl+C)", false, Cmd::Copy),
+                            (
+                                icon::PAINT_BRUSH,
+                                "Format",
+                                painter,
+                                painting,
+                                Cmd::FormatPainter,
+                            ),
+                        ];
+                        for (glyph, label, tip, on, cmd) in small {
+                            if mini_tool(ui, glyph, label, tip, on).clicked() {
+                                clicked.push(cmd);
+                            }
+                        }
+                    });
+                });
             });
-            if redo.inner.clicked() {
-                clicked.push(Cmd::Redo);
-            }
-            divider(ui, &palette);
-
-            ComboBox::from_id_salt("kind")
-                .width(104.0)
-                .selected_text(para.kind.name())
-                .show_ui(ui, |ui| {
+            group(ui, p, "Font", |ui| {
+                ui.horizontal(|ui| {
+                    // Each font is named in its own letters.
+                    let face = |font: Font| {
+                        RichText::new(font.family())
+                            .family(layout::family(font, false))
+                            .size(14.5)
+                    };
+                    ComboBox::from_id_salt("font")
+                        .width(150.0)
+                        .height(380.0)
+                        .selected_text(face(format.font))
+                        .show_ui(ui, |ui| {
+                            for font in layout::fonts(format.font) {
+                                let chosen = ui.selectable_label(font == format.font, face(font));
+                                if chosen.clicked() {
+                                    clicked.push(edit(Edit::Font(font)));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Font");
+                    ComboBox::from_id_salt("size")
+                        .width(52.0)
+                        .height(380.0)
+                        .selected_text(format!("{}", format.size))
+                        .show_ui(ui, |ui| {
+                            for size in SIZES {
+                                let label = format!("{size}");
+                                if ui.selectable_label(size == format.size, label).clicked() {
+                                    clicked.push(edit(Edit::Size(size)));
+                                }
+                            }
+                        })
+                        .response
+                        .on_hover_text("Font size (points)");
+                    let resize = |by: f32| {
+                        let size = (format.size + by).clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
+                        edit(Edit::Size(size))
+                    };
+                    if widgets::small_icon_button(ui, icon::CARET_UP, "Larger text").clicked() {
+                        clicked.push(resize(1.0));
+                    }
+                    if widgets::small_icon_button(ui, icon::CARET_DOWN, "Smaller text").clicked() {
+                        clicked.push(resize(-1.0));
+                    }
+                    let case = widgets::icon_button(ui, icon::TEXT_AA, "Change case");
+                    Popup::menu(&case).show(|ui| {
+                        let cases = [
+                            ("UPPERCASE", Case::Upper),
+                            ("lowercase", Case::Lower),
+                            ("Title Case", Case::Title),
+                        ];
+                        for (label, case) in cases {
+                            if ui.button(label).clicked() {
+                                clicked.push(edit(Edit::Case(case)));
+                            }
+                        }
+                    });
+                    if widgets::icon_button(ui, icon::ERASER, "Clear formatting").clicked() {
+                        clicked.push(edit(Edit::ClearFormat));
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let toggles = [
+                        (icon::TEXT_B, "Bold (Ctrl+B)", Flag::Bold, format.bold),
+                        (
+                            icon::TEXT_ITALIC,
+                            "Italic (Ctrl+I)",
+                            Flag::Italic,
+                            format.italic,
+                        ),
+                        (
+                            icon::TEXT_UNDERLINE,
+                            "Underline (Ctrl+U)",
+                            Flag::Underline,
+                            format.underline,
+                        ),
+                        (
+                            icon::TEXT_STRIKETHROUGH,
+                            "Strikethrough",
+                            Flag::Strike,
+                            format.strike,
+                        ),
+                    ];
+                    for (glyph, tip, flag, on) in toggles {
+                        if widgets::toggle_button(ui, glyph, tip, on).clicked() {
+                            clicked.push(edit(Edit::Toggle(flag)));
+                        }
+                    }
+                    let scripts = [
+                        (icon::TEXT_SUBSCRIPT, "Subscript", Script::Sub),
+                        (icon::TEXT_SUPERSCRIPT, "Superscript", Script::Super),
+                    ];
+                    for (glyph, tip, script) in scripts {
+                        if widgets::toggle_button(ui, glyph, tip, format.script == script).clicked()
+                        {
+                            clicked.push(edit(Edit::Script(script)));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    let marker = color_tool(
+                        ui,
+                        p,
+                        icon::HIGHLIGHTER,
+                        "Highlight colour",
+                        format.highlight,
+                    );
+                    Popup::menu(&marker).show(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.spacing_mut().item_spacing.x = 2.0;
+                            highlight_swatches(ui, format.highlight, p, clicked);
+                        });
+                    });
+                    let ink = color_tool(
+                        ui,
+                        p,
+                        icon::TEXT_A_UNDERLINE,
+                        "Text colour",
+                        Some(format.color),
+                    );
+                    Popup::menu(&ink).show(|ui| {
+                        ui.spacing_mut().item_spacing = vec2(2.0, 2.0);
+                        for line in TEXT_COLORS.chunks(10) {
+                            ui.horizontal(|ui| {
+                                for &(color, name) in line {
+                                    let dot = swatch(ui, color, format.color == color, p);
+                                    if dot.on_hover_text(name).clicked() {
+                                        clicked.push(edit(Edit::Color(color)));
+                                    }
+                                }
+                            });
+                        }
+                    });
+                });
+            });
+            group(ui, p, "Paragraph", |ui| {
+                ui.horizontal(|ui| {
+                    let lists = [
+                        (icon::LIST_BULLETS, "Bullet list", List::Bullet),
+                        (icon::LIST_NUMBERS, "Numbered list", List::Number),
+                        (icon::LIST_DASHES, "Dash list", List::Dash),
+                    ];
+                    for (glyph, tip, list) in lists {
+                        if widgets::toggle_button(ui, glyph, tip, para.list == list).clicked() {
+                            clicked.push(edit(Edit::List(list)));
+                        }
+                    }
+                    if widgets::icon_button(ui, icon::TEXT_OUTDENT, "Decrease indent").clicked() {
+                        clicked.push(edit(Edit::Indent(-1)));
+                    }
+                    if widgets::icon_button(ui, icon::TEXT_INDENT, "Increase indent").clicked() {
+                        clicked.push(edit(Edit::Indent(1)));
+                    }
+                    let marks = "Show the spaces and the ends of paragraphs";
+                    if widgets::toggle_button(ui, icon::PARAGRAPH, marks, self.show_marks).clicked()
+                    {
+                        clicked.push(Cmd::Marks);
+                    }
+                });
+                ui.horizontal(|ui| {
+                    let aligns = [
+                        (icon::TEXT_ALIGN_LEFT, "Align left", ParaAlign::Left),
+                        (icon::TEXT_ALIGN_CENTER, "Center", ParaAlign::Center),
+                        (icon::TEXT_ALIGN_RIGHT, "Align right", ParaAlign::Right),
+                        (icon::TEXT_ALIGN_JUSTIFY, "Justify", ParaAlign::Justify),
+                    ];
+                    for (glyph, tip, align) in aligns {
+                        if widgets::toggle_button(ui, glyph, tip, para.align == align).clicked() {
+                            clicked.push(edit(Edit::Align(align)));
+                        }
+                    }
+                    let spacing = widgets::icon_button(ui, icon::ARROWS_VERTICAL, "Line spacing");
+                    Popup::menu(&spacing).show(|ui| {
+                        let now = (para.line_factor() * 100.0).round() as u16;
+                        for (name, line) in LINE_SPACINGS {
+                            if ui.selectable_label(line == now, name).clicked() {
+                                clicked.push(edit(Edit::Line(line)));
+                            }
+                        }
+                        ui.separator();
+                        if ui.button("Line spacing options…").clicked() {
+                            clicked.push(Cmd::ParagraphWindow);
+                        }
+                    });
+                    let rule = "A line under the paragraph";
+                    if widgets::toggle_button(ui, icon::MINUS, rule, para.rule).clicked() {
+                        clicked.push(edit(Edit::Rule));
+                    }
+                });
+            });
+            group(ui, p, "Styles", |ui| {
+                ui.horizontal(|ui| {
+                    ui.spacing_mut().item_spacing.x = 4.0;
                     for kind in Kind::ALL {
-                        let look = kind.format();
-                        let label = RichText::new(kind.name()).size(look.size.min(18.0));
-                        if ui.selectable_label(kind == para.kind, label).clicked() {
-                            clicked.push(Cmd::Edit(Edit::Kind(kind)));
+                        if style_card(ui, p, kind, kind == para.kind).clicked() {
+                            clicked.push(edit(Edit::Kind(kind)));
                         }
                     }
-                })
-                .response
-                .on_hover_text("Paragraph style");
-            ui.add_space(4.0);
-            ComboBox::from_id_salt("font")
-                .width(138.0)
-                .selected_text(format.font.family())
-                .show_ui(ui, |ui| {
-                    for font in Font::ALL {
-                        let chosen = ui.selectable_label(font == format.font, font.family());
-                        if chosen.clicked() {
-                            clicked.push(Cmd::Edit(Edit::Font(font)));
-                        }
-                    }
-                })
-                .response
-                .on_hover_text("Font");
-            ui.add_space(4.0);
-            let resize = |by: f32| {
-                let size = (format.size + by).clamp(*SIZE_RANGE.start(), *SIZE_RANGE.end());
-                Cmd::Edit(Edit::Size(size))
-            };
-            if widgets::small_icon_button(ui, icon::MINUS, "Smaller text").clicked() {
-                clicked.push(resize(-1.0));
-            }
-            let size = RichText::new(format!("{}", format.size)).size(14.0);
-            ui.add_sized(vec2(34.0, 22.0), egui::Label::new(size).selectable(false))
-                .on_hover_text("Font size (points)");
-            if widgets::small_icon_button(ui, icon::PLUS, "Larger text").clicked() {
-                clicked.push(resize(1.0));
-            }
-            divider(ui, &palette);
-
-            let toggles = [
-                (icon::TEXT_B, "Bold (Ctrl+B)", Flag::Bold, format.bold),
-                (
-                    icon::TEXT_ITALIC,
-                    "Italic (Ctrl+I)",
-                    Flag::Italic,
-                    format.italic,
-                ),
-                (
-                    icon::TEXT_UNDERLINE,
-                    "Underline (Ctrl+U)",
-                    Flag::Underline,
-                    format.underline,
-                ),
-                (
-                    icon::TEXT_STRIKETHROUGH,
-                    "Strikethrough",
-                    Flag::Strike,
-                    format.strike,
-                ),
-            ];
-            for (glyph, tip, flag, on) in toggles {
-                if widgets::toggle_button(ui, glyph, tip, on).clicked() {
-                    clicked.push(Cmd::Edit(Edit::Toggle(flag)));
-                }
-            }
-            divider(ui, &palette);
-            for (color, name) in SWATCHES {
-                if swatch(ui, color, format.color == color, &palette)
-                    .on_hover_text(name)
-                    .clicked()
-                {
-                    clicked.push(Cmd::Edit(Edit::Color(color)));
-                }
-            }
-            divider(ui, &palette);
-            let aligns = [
-                (icon::TEXT_ALIGN_LEFT, "Align left", ParaAlign::Left),
-                (icon::TEXT_ALIGN_CENTER, "Center", ParaAlign::Center),
-                (icon::TEXT_ALIGN_RIGHT, "Align right", ParaAlign::Right),
-                (icon::TEXT_ALIGN_JUSTIFY, "Justify", ParaAlign::Justify),
-            ];
-            for (glyph, tip, align) in aligns {
-                if widgets::toggle_button(ui, glyph, tip, para.align == align).clicked() {
-                    clicked.push(Cmd::Edit(Edit::Align(align)));
-                }
-            }
-            divider(ui, &palette);
-            let lists = [
-                (icon::LIST_BULLETS, "Bullet list", List::Bullet),
-                (icon::LIST_NUMBERS, "Numbered list", List::Number),
-                (icon::LIST_DASHES, "Dash list", List::Dash),
-            ];
-            for (glyph, tip, list) in lists {
-                if widgets::toggle_button(ui, glyph, tip, para.list == list).clicked() {
-                    clicked.push(Cmd::Edit(Edit::List(list)));
-                }
-            }
-            divider(ui, &palette);
-            let marker = RichText::new(icon::HIGHLIGHTER).size(16.0);
-            ui.label(marker.color(palette.text_dim))
-                .on_hover_text("Highlight colour");
-            highlight_swatches(ui, format.highlight, &palette, clicked);
-            divider(ui, &palette);
-            let scripts = [
-                (icon::TEXT_SUPERSCRIPT, "Superscript", Script::Super),
-                (icon::TEXT_SUBSCRIPT, "Subscript", Script::Sub),
-            ];
-            for (glyph, tip, script) in scripts {
-                if widgets::toggle_button(ui, glyph, tip, format.script == script).clicked() {
-                    clicked.push(Cmd::Edit(Edit::Script(script)));
-                }
-            }
-            let case = widgets::icon_button(ui, icon::TEXT_AA, "Change case");
-            Popup::menu(&case).show(|ui| {
-                let cases = [
-                    ("UPPERCASE", Case::Upper),
-                    ("lowercase", Case::Lower),
-                    ("Title Case", Case::Title),
-                ];
-                for (label, case) in cases {
-                    if ui.button(label).clicked() {
-                        clicked.push(Cmd::Edit(Edit::Case(case)));
-                    }
-                }
+                });
             });
-            let painting = self.tabs[self.active].painter.is_some();
-            let tip = "Format painter: click, then select the text that takes this look";
-            if widgets::toggle_button(ui, icon::PAINT_BRUSH, tip, painting).clicked() {
-                clicked.push(Cmd::FormatPainter);
-            }
-            if widgets::icon_button(ui, icon::ERASER, "Clear formatting").clicked() {
-                clicked.push(Cmd::Edit(Edit::ClearFormat));
-            }
-            divider(ui, &palette);
-            if widgets::icon_button(ui, icon::TEXT_OUTDENT, "Decrease indent").clicked() {
-                clicked.push(Cmd::Edit(Edit::Indent(-1)));
-            }
-            if widgets::icon_button(ui, icon::TEXT_INDENT, "Increase indent").clicked() {
-                clicked.push(Cmd::Edit(Edit::Indent(1)));
-            }
-            divider(ui, &palette);
-            if widgets::icon_button(ui, icon::IMAGE, "Insert an image").clicked() {
-                clicked.push(Cmd::InsertImage);
-            }
-            let table = widgets::icon_button(ui, icon::TABLE, "Insert a table");
-            Popup::menu(&table).show(|ui| {
-                if let Some((rows, cols)) = table_picker(ui, &palette) {
-                    clicked.push(Cmd::Table(rows, cols));
+            group(ui, p, "Editing", |ui| {
+                ui.spacing_mut().item_spacing.y = 1.0;
+                let small = [
+                    (icon::MAGNIFYING_GLASS, "Find", "Find (Ctrl+F)", Cmd::Find),
+                    (
+                        icon::SWAP,
+                        "Replace",
+                        "Find and replace (Ctrl+F)",
+                        Cmd::Find,
+                    ),
+                    (
+                        icon::SELECTION_ALL,
+                        "Select all",
+                        "Select all (Ctrl+A)",
+                        Cmd::SelectAll,
+                    ),
+                ];
+                for (glyph, label, tip, cmd) in small {
+                    if mini_tool(ui, glyph, label, tip, false).clicked() {
+                        clicked.push(cmd);
+                    }
                 }
             });
         });
@@ -1547,6 +1964,7 @@ impl GodApp {
             return self.format_bar(ui, clicked);
         }
         let palette = Palette::of(ui);
+        let p = &palette;
         let tab = &self.tabs[self.active];
         let para = tab.para();
         let page = tab.doc.page;
@@ -1557,225 +1975,1037 @@ impl GodApp {
         let row = vec2(wide.unwrap_or(0.0), BAR_HEIGHT);
         ui.allocate_ui_with_layout(row, Layout::left_to_right(Align::Center), |ui| {
             ui.spacing_mut().item_spacing.x = 2.0;
-            let p = &palette;
+            ui.style_mut().wrap_mode = Some(egui::TextWrapMode::Extend);
+            ui.add_space(4.0);
             match self.ribbon {
                 Ribbon::Home => {}
                 Ribbon::File => {
-                    tool(ui, p, clicked, icon::FILE_PLUS, "New", false, Cmd::New);
-                    tool(ui, p, clicked, icon::FOLDER_OPEN, "Open", false, Cmd::Open);
-                    tool(ui, p, clicked, icon::FLOPPY_DISK, "Save", false, Cmd::Save);
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::FLOPPY_DISK,
-                        "Save as",
-                        false,
-                        Cmd::SaveAs,
-                    );
-                    divider(ui, p);
-                    let markdown = Cmd::Export(Export::Markdown);
-                    tool(ui, p, clicked, icon::FILE_MD, "Markdown", false, markdown);
-                    let page = Cmd::Export(Export::Html);
-                    tool(ui, p, clicked, icon::FILE_HTML, "Web page", false, page);
-                    divider(ui, p);
-                    tool(ui, p, clicked, icon::X, "Close", false, Cmd::CloseTab);
-                    tool(ui, p, clicked, icon::SIGN_OUT, "Quit", false, Cmd::Quit);
+                    tools(ui, p, "Document", |ui| {
+                        tool(ui, p, clicked, icon::FILE_PLUS, "New", false, Cmd::New);
+                        tool(ui, p, clicked, icon::FOLDER_OPEN, "Open", false, Cmd::Open);
+                        tool(ui, p, clicked, icon::FLOPPY_DISK, "Save", false, Cmd::Save);
+                        let save_as = icon::FLOPPY_DISK_BACK;
+                        tool(ui, p, clicked, save_as, "Save as", false, Cmd::SaveAs);
+                    });
+                    tools(ui, p, "Print", |ui| {
+                        tool(ui, p, clicked, icon::PRINTER, "Print", false, Cmd::Print);
+                    });
+                    tools(ui, p, "Export", |ui| {
+                        let pdf = Cmd::Export(Export::Pdf);
+                        tool(ui, p, clicked, icon::FILE_PDF, "PDF", false, pdf);
+                        let markdown = Cmd::Export(Export::Markdown);
+                        tool(ui, p, clicked, icon::FILE_MD, "Markdown", false, markdown);
+                        let page = Cmd::Export(Export::Html);
+                        tool(ui, p, clicked, icon::FILE_HTML, "Web page", false, page);
+                    });
+                    tools(ui, p, "Window", |ui| {
+                        tool(ui, p, clicked, icon::X, "Close", false, Cmd::CloseTab);
+                        tool(ui, p, clicked, icon::SIGN_OUT, "Quit", false, Cmd::Quit);
+                    });
                 }
                 Ribbon::Insert => {
-                    let contents = icon::LIST_MAGNIFYING_GLASS;
-                    tool(ui, p, clicked, contents, "Contents", false, Cmd::Contents);
-                    divider(ui, p);
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::IMAGE,
-                        "Image",
-                        false,
-                        Cmd::InsertImage,
-                    );
-                    let table = ribbon_button(ui, p, icon::TABLE, "Table", false);
-                    Popup::menu(&table).show(|ui| {
-                        if let Some((rows, cols)) = table_picker(ui, p) {
-                            clicked.push(Cmd::Table(rows, cols));
-                        }
+                    tools(ui, p, "Pages", |ui| {
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::FILE,
+                            "Blank page",
+                            false,
+                            Cmd::BlankPage,
+                        );
+                        let page_break = icon::FILE_DASHED;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            page_break,
+                            "Page break",
+                            false,
+                            Cmd::PageBreak,
+                        );
                     });
-                    divider(ui, p);
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::FILE_DASHED,
-                        "Page break",
-                        false,
-                        Cmd::PageBreak,
-                    );
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::MINUS,
-                        "Line",
-                        para.rule,
-                        edit(Edit::Rule),
-                    );
-                    divider(ui, p);
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::CALENDAR_BLANK,
-                        "Date",
-                        false,
-                        Cmd::InsertDate,
-                    );
-                    let symbol = ribbon_button(ui, p, icon::HASH, "Symbol", false);
-                    Popup::menu(&symbol).show(|ui| {
-                        for (symbol, name) in SYMBOLS {
-                            menu_item(ui, clicked, symbol, name, "", Cmd::InsertText(symbol));
-                        }
+                    tools(ui, p, "Tables", |ui| {
+                        let table = ribbon_button(ui, p, icon::TABLE, "Table", false);
+                        Popup::menu(&table).show(|ui| {
+                            if let Some((rows, cols)) = table_picker(ui, p) {
+                                clicked.push(Cmd::Table(rows, cols));
+                            }
+                        });
                     });
-                    divider(ui, p);
-                    let numbered = tab.doc.page_numbers;
-                    let numbers = icon::LIST_NUMBERS;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        numbers,
-                        "Page numbers",
-                        numbered,
-                        Cmd::PageNumbers,
-                    );
+                    tools(ui, p, "Illustrations", |ui| {
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::IMAGE,
+                            "Picture",
+                            false,
+                            Cmd::InsertImage,
+                        );
+                    });
+                    tools(ui, p, "Links", |ui| {
+                        let linked = tab.current().link != 0;
+                        tool(ui, p, clicked, icon::LINK, "Link", linked, Cmd::LinkWindow);
+                    });
+                    tools(ui, p, "Header & Footer", |ui| {
+                        let open = self.banner_open;
+                        let header = icon::ALIGN_TOP;
+                        tool(ui, p, clicked, header, "Header", open, Cmd::BannerWindow);
+                        let footer = icon::ALIGN_BOTTOM;
+                        tool(ui, p, clicked, footer, "Footer", open, Cmd::BannerWindow);
+                        let numbered = tab.doc.page_numbers;
+                        let numbers = icon::HASH;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            numbers,
+                            "Page number",
+                            numbered,
+                            Cmd::PageNumbers,
+                        );
+                    });
+                    tools(ui, p, "Text", |ui| {
+                        let date = icon::CALENDAR_BLANK;
+                        tool(ui, p, clicked, date, "Date", false, Cmd::InsertDate);
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::MINUS,
+                            "Line",
+                            para.rule,
+                            edit(Edit::Rule),
+                        );
+                    });
+                    tools(ui, p, "Symbols", |ui| {
+                        let symbol = ribbon_button(ui, p, icon::ASTERISK, "Symbol", false);
+                        Popup::menu(&symbol).show(|ui| {
+                            for (symbol, name) in SYMBOLS {
+                                menu_item(ui, clicked, symbol, name, "", Cmd::InsertText(symbol));
+                            }
+                        });
+                    });
                 }
                 Ribbon::Layout => {
-                    let portrait = !page.landscape;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        icon::FILE_TEXT,
-                        "Portrait",
-                        portrait,
-                        Cmd::Landscape(false),
-                    );
-                    let landscape = icon::DEVICE_TABLET;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        landscape,
-                        "Landscape",
-                        !portrait,
-                        Cmd::Landscape(true),
-                    );
-                    divider(ui, p);
-                    let margins = [
-                        (icon::ARROWS_HORIZONTAL, "Normal margins", Margins::Normal),
-                        (
-                            icon::ARROWS_OUT_LINE_HORIZONTAL,
-                            "Narrow margins",
-                            Margins::Narrow,
-                        ),
-                        (
-                            icon::ARROWS_IN_LINE_HORIZONTAL,
-                            "Wide margins",
-                            Margins::Wide,
-                        ),
-                    ];
-                    for (glyph, label, kind) in margins {
-                        let on = page.margins == kind;
-                        tool(ui, p, clicked, glyph, label, on, Cmd::PageMargins(kind));
-                    }
-                    divider(ui, p);
-                    for spacing in Spacing::ALL {
-                        let on = para.spacing == spacing;
-                        let cmd = edit(Edit::Spacing(spacing));
-                        tool(ui, p, clicked, icon::LIST_DASHES, spacing.name(), on, cmd);
-                    }
-                    divider(ui, p);
-                    let numbered = tab.doc.page_numbers;
-                    let numbers = icon::LIST_NUMBERS;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        numbers,
-                        "Page numbers",
-                        numbered,
-                        Cmd::PageNumbers,
-                    );
+                    tools(ui, p, "Page Setup", |ui| {
+                        let margins = ribbon_button(ui, p, icon::FRAME_CORNERS, "Margins", false);
+                        Popup::menu(&margins).show(|ui| {
+                            for kind in Margins::ALL {
+                                let on = page.custom.is_none() && page.margins == kind;
+                                if ui.selectable_label(on, kind.name()).clicked() {
+                                    clicked.push(Cmd::PageMargins(kind));
+                                }
+                            }
+                            ui.separator();
+                            let custom = page.custom.is_some();
+                            if ui.selectable_label(custom, "Custom margins…").clicked() {
+                                clicked.push(Cmd::PageWindow);
+                            }
+                        });
+                        let turned = ribbon_button(ui, p, icon::FILE_TEXT, "Orientation", false);
+                        Popup::menu(&turned).show(|ui| {
+                            for (label, landscape) in [("Portrait", false), ("Landscape", true)] {
+                                let on = page.landscape == landscape;
+                                if ui.selectable_label(on, label).clicked() {
+                                    clicked.push(Cmd::Landscape(landscape));
+                                }
+                            }
+                        });
+                        let size = ribbon_button(ui, p, icon::RESIZE, "Size", false);
+                        Popup::menu(&size).show(|ui| {
+                            for paper in Paper::ALL {
+                                if ui
+                                    .selectable_label(page.paper == paper, paper.name())
+                                    .clicked()
+                                {
+                                    clicked.push(Cmd::Paper(paper));
+                                }
+                            }
+                        });
+                        let columns = ribbon_button(ui, p, icon::COLUMNS, "Columns", false);
+                        Popup::menu(&columns).show(|ui| {
+                            for (name, count) in [("One", 1), ("Two", 2), ("Three", 3)] {
+                                let on = page.columns.max(1) == count;
+                                if ui.selectable_label(on, name).clicked() {
+                                    clicked.push(Cmd::Columns(count));
+                                }
+                            }
+                        });
+                        let page_break = icon::FILE_DASHED;
+                        tool(ui, p, clicked, page_break, "Breaks", false, Cmd::PageBreak);
+                    });
+                    tools(ui, p, "Arrange", |ui| {
+                        let picture = tab.view.selected_picture;
+                        let now = picture.map(|para| tab.doc.paras()[para].wrap);
+                        ui.add_enabled_ui(picture.is_some(), |ui| {
+                            let wrap = ribbon_button(ui, p, icon::TEXT_INDENT, "Wrap text", false);
+                            Popup::menu(&wrap).show(|ui| {
+                                let places = [
+                                    ("Above its text", Wrap::Above),
+                                    ("Left, text beside it", Wrap::Left),
+                                    ("Right, text beside it", Wrap::Right),
+                                ];
+                                for (name, place) in places {
+                                    if ui.selectable_label(now == Some(place), name).clicked() {
+                                        clicked.push(Cmd::Wrap(place));
+                                    }
+                                }
+                            });
+                        });
+                    });
+                    tools(ui, p, "Paragraph", |ui| {
+                        ui.vertical(|ui| {
+                            // Two rows of fields under their names, in the height of a group.
+                            ui.spacing_mut().interact_size.y = 18.0;
+                            ui.spacing_mut().button_padding.y = 0.0;
+                            let small = |name: &str| RichText::new(name).size(12.0);
+                            let dim = |name: &str| small(name).color(p.text_dim);
+                            let grid = egui::Grid::new("paragraph-measures").num_columns(4);
+                            grid.spacing(vec2(6.0, 1.0))
+                                .min_row_height(16.0)
+                                .show(ui, |ui| {
+                                    ui.label(dim("Indent"));
+                                    ui.label("");
+                                    ui.label(dim("Spacing"));
+                                    ui.end_row();
+                                    ui.label(small("Left"));
+                                    if let Some(left) = length(ui, "left", para.left, 0.0..=20.0) {
+                                        clicked.push(edit(Edit::Left(left)));
+                                    }
+                                    ui.label(small("Before"));
+                                    if let Some(before) = points(ui, "before", para.before) {
+                                        clicked.push(edit(Edit::Before(before)));
+                                    }
+                                    ui.end_row();
+                                    ui.label(small("Right"));
+                                    if let Some(right) = length(ui, "right", para.right, 0.0..=20.0)
+                                    {
+                                        clicked.push(edit(Edit::Right(right)));
+                                    }
+                                    ui.label(small("After"));
+                                    if let Some(after) = points(ui, "after", para.after) {
+                                        clicked.push(edit(Edit::After(after)));
+                                    }
+                                    ui.end_row();
+                                });
+                        });
+                        let spacing =
+                            ribbon_button(ui, p, icon::ARROWS_VERTICAL, "Line spacing", false);
+                        Popup::menu(&spacing).show(|ui| {
+                            let now = (para.line_factor() * 100.0).round() as u16;
+                            for (name, line) in LINE_SPACINGS {
+                                if ui.selectable_label(line == now, name).clicked() {
+                                    clicked.push(edit(Edit::Line(line)));
+                                }
+                            }
+                        });
+                        let more = icon::SLIDERS_HORIZONTAL;
+                        let open = self.paragraph_open;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            more,
+                            "Paragraph",
+                            open,
+                            Cmd::ParagraphWindow,
+                        );
+                    });
+                }
+                Ribbon::References => {
+                    tools(ui, p, "Table of Contents", |ui| {
+                        let contents = icon::LIST_MAGNIFYING_GLASS;
+                        tool(ui, p, clicked, contents, "Contents", false, Cmd::Contents);
+                    });
+                    tools(ui, p, "Headings", |ui| {
+                        let heading = para.kind.heading_level().is_some();
+                        ui.add_enabled_ui(heading, |ui| {
+                            let numbered = para.list == List::Number;
+                            let numbers = icon::LIST_NUMBERS;
+                            let number = edit(Edit::List(List::Number));
+                            tool(ui, p, clicked, numbers, "Numbering", numbered, number);
+                            let up = icon::ARROW_FAT_LEFT;
+                            tool(
+                                ui,
+                                p,
+                                clicked,
+                                up,
+                                "Level up",
+                                false,
+                                edit(Edit::Nest(false)),
+                            );
+                            let down = icon::ARROW_FAT_RIGHT;
+                            tool(
+                                ui,
+                                p,
+                                clicked,
+                                down,
+                                "Level down",
+                                false,
+                                edit(Edit::Nest(true)),
+                            );
+                        });
+                    });
+                    tools(ui, p, "Navigation", |ui| {
+                        let pane = icon::SIDEBAR_SIMPLE;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            pane,
+                            "Headings pane",
+                            self.show_outline,
+                            Cmd::Outline,
+                        );
+                    });
+                }
+                Ribbon::Review => {
+                    tools(ui, p, "Proofing", |ui| {
+                        let check = icon::CHECK_SQUARE;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            check,
+                            "Spelling",
+                            self.spelling,
+                            Cmd::Spelling,
+                        );
+                        let language = ribbon_button(ui, p, icon::TRANSLATE, "Language", false);
+                        Popup::menu(&language).show(|ui| {
+                            for language in crate::spell::Language::ALL {
+                                let on = self.language == language;
+                                if ui.selectable_label(on, language.name()).clicked() {
+                                    clicked.push(Cmd::Language(language));
+                                }
+                            }
+                        });
+                        let count = icon::LIST_NUMBERS;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            count,
+                            "Word count",
+                            self.counting,
+                            Cmd::WordCount,
+                        );
+                    });
+                    tools(ui, p, "Comments", |ui| {
+                        let new = icon::CHAT_TEXT;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            new,
+                            "New comment",
+                            false,
+                            Cmd::CommentWindow,
+                        );
+                        let shown = self.show_comments;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::CHATS,
+                            "Show comments",
+                            shown,
+                            Cmd::Comments,
+                        );
+                    });
+                    tools(ui, p, "Tracking", |ui| {
+                        let track = icon::PENCIL_LINE;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            track,
+                            "Track changes",
+                            tab.tracking,
+                            Cmd::Track,
+                        );
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::CHECK,
+                            "Accept",
+                            false,
+                            Cmd::Changes(true),
+                        );
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::X,
+                            "Reject",
+                            false,
+                            Cmd::Changes(false),
+                        );
+                    });
+                    tools(ui, p, "Find", |ui| {
+                        let find = icon::MAGNIFYING_GLASS;
+                        tool(ui, p, clicked, find, "Find", self.find.open, Cmd::Find);
+                        tool(ui, p, clicked, icon::SWAP, "Replace", false, Cmd::Find);
+                    });
+                    tools(ui, p, "Formatting", |ui| {
+                        let marks = self.show_marks;
+                        tool(ui, p, clicked, icon::PARAGRAPH, "Marks", marks, Cmd::Marks);
+                        let clear = edit(Edit::ClearFormat);
+                        tool(ui, p, clicked, icon::ERASER, "Clear", false, clear);
+                    });
                 }
                 Ribbon::Table => {
-                    let table = ribbon_button(ui, p, icon::TABLE, "New table", false);
-                    Popup::menu(&table).show(|ui| {
-                        if let Some((rows, cols)) = table_picker(ui, p) {
-                            clicked.push(Cmd::Table(rows, cols));
-                        }
+                    tools(ui, p, "Table", |ui| {
+                        let table = ribbon_button(ui, p, icon::TABLE, "New table", false);
+                        Popup::menu(&table).show(|ui| {
+                            if let Some((rows, cols)) = table_picker(ui, p) {
+                                clicked.push(Cmd::Table(rows, cols));
+                            }
+                        });
                     });
-                    divider(ui, p);
                     // The rest acts on the table the caret is in.
-                    ui.add_enabled_ui(para.cell.is_some(), |ui| {
-                        let tools = [
-                            (icon::ARROW_LINE_UP, "Row above", Cmd::TableRow(false)),
-                            (icon::ARROW_LINE_DOWN, "Row below", Cmd::TableRow(true)),
-                            (icon::ARROW_LINE_LEFT, "Column left", Cmd::TableCol(false)),
-                            (icon::ARROW_LINE_RIGHT, "Column right", Cmd::TableCol(true)),
-                            (icon::ROWS, "Delete row", Cmd::DeleteLine(true)),
-                            (icon::COLUMNS, "Delete column", Cmd::DeleteLine(false)),
-                            (icon::TRASH, "Delete table", Cmd::DeleteTable),
-                        ];
-                        for (glyph, label, cmd) in tools {
-                            tool(ui, p, clicked, glyph, label, false, cmd);
-                        }
+                    let inside = para.cell.is_some();
+                    tools(ui, p, "Rows & Columns", |ui| {
+                        ui.add_enabled_ui(inside, |ui| {
+                            let tools = [
+                                (icon::ARROW_LINE_UP, "Row above", Cmd::TableRow(false)),
+                                (icon::ARROW_LINE_DOWN, "Row below", Cmd::TableRow(true)),
+                                (icon::ARROW_LINE_LEFT, "Column left", Cmd::TableCol(false)),
+                                (icon::ARROW_LINE_RIGHT, "Column right", Cmd::TableCol(true)),
+                            ];
+                            for (glyph, label, cmd) in tools {
+                                tool(ui, p, clicked, glyph, label, false, cmd);
+                            }
+                        });
+                    });
+                    tools(ui, p, "Merge", |ui| {
+                        ui.add_enabled_ui(inside, |ui| {
+                            let merge = icon::ARROWS_MERGE;
+                            tool(ui, p, clicked, merge, "Merge right", false, Cmd::MergeCell);
+                            let split = icon::ARROWS_SPLIT;
+                            tool(ui, p, clicked, split, "Split cell", false, Cmd::SplitCell);
+                        });
+                    });
+                    tools(ui, p, "Delete", |ui| {
+                        ui.add_enabled_ui(inside, |ui| {
+                            let tools = [
+                                (icon::ROWS, "Row", Cmd::DeleteLine(true)),
+                                (icon::COLUMNS, "Column", Cmd::DeleteLine(false)),
+                                (icon::TRASH, "Table", Cmd::DeleteTable),
+                            ];
+                            for (glyph, label, cmd) in tools {
+                                tool(ui, p, clicked, glyph, label, false, cmd);
+                            }
+                        });
                     });
                 }
                 Ribbon::View => {
-                    let pane = icon::SIDEBAR_SIMPLE;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        pane,
-                        "Navigation",
-                        self.show_outline,
-                        Cmd::Outline,
-                    );
-                    let marks = self.show_marks;
-                    tool(ui, p, clicked, icon::PARAGRAPH, "Marks", marks, Cmd::Marks);
-                    divider(ui, p);
-                    let zoom_out = icon::MAGNIFYING_GLASS_MINUS;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        zoom_out,
-                        "Zoom out",
-                        false,
-                        Cmd::Zoom(self.zoom - 0.1),
-                    );
-                    let actual = icon::MAGNIFYING_GLASS;
-                    tool(ui, p, clicked, actual, "100%", false, Cmd::Zoom(1.0));
-                    let zoom_in = icon::MAGNIFYING_GLASS_PLUS;
-                    tool(
-                        ui,
-                        p,
-                        clicked,
-                        zoom_in,
-                        "Zoom in",
-                        false,
-                        Cmd::Zoom(self.zoom + 0.1),
-                    );
-                    divider(ui, p);
-                    let (glyph, label) = if self.dark {
-                        (icon::SUN, "Light mode")
-                    } else {
-                        (icon::MOON, "Dark mode")
-                    };
-                    tool(ui, p, clicked, glyph, label, false, Cmd::ToggleTheme);
+                    tools(ui, p, "Views", |ui| {
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::CORNERS_OUT,
+                            "Focus",
+                            false,
+                            Cmd::Focus,
+                        );
+                    });
+                    tools(ui, p, "Show", |ui| {
+                        let pane = icon::SIDEBAR_SIMPLE;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            pane,
+                            "Navigation",
+                            self.show_outline,
+                            Cmd::Outline,
+                        );
+                        let marks = self.show_marks;
+                        tool(ui, p, clicked, icon::PARAGRAPH, "Marks", marks, Cmd::Marks);
+                    });
+                    tools(ui, p, "Zoom", |ui| {
+                        let out = icon::MAGNIFYING_GLASS_MINUS;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            out,
+                            "Zoom out",
+                            false,
+                            Cmd::Zoom(self.zoom - 0.1),
+                        );
+                        let actual = icon::MAGNIFYING_GLASS;
+                        tool(ui, p, clicked, actual, "100%", false, Cmd::Zoom(1.0));
+                        let zoom_in = icon::MAGNIFYING_GLASS_PLUS;
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            zoom_in,
+                            "Zoom in",
+                            false,
+                            Cmd::Zoom(self.zoom + 0.1),
+                        );
+                        let width = icon::ARROWS_HORIZONTAL;
+                        tool(ui, p, clicked, width, "Page width", false, Cmd::Fit(false));
+                        tool(
+                            ui,
+                            p,
+                            clicked,
+                            icon::FILE,
+                            "One page",
+                            false,
+                            Cmd::Fit(true),
+                        );
+                    });
+                    tools(ui, p, "Theme", |ui| {
+                        let (glyph, label) = if self.dark {
+                            (icon::SUN, "Light mode")
+                        } else {
+                            (icon::MOON, "Dark mode")
+                        };
+                        tool(ui, p, clicked, glyph, label, false, Cmd::ToggleTheme);
+                    });
                 }
             }
+        });
+    }
+
+    /// What every page says in its top and bottom margins, to type.
+    fn banner_window(&mut self, ctx: &Context) {
+        if !self.banner_open || self.home {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        let (mut header, mut footer) = (tab.doc.header.clone(), tab.doc.footer.clone());
+        let mut typing = false;
+        self.banner_open = dialog(ctx, "Header & Footer", |ui| {
+            let grid = egui::Grid::new("banners").num_columns(4);
+            grid.spacing(vec2(8.0, 7.0)).show(ui, |ui| {
+                ui.label("");
+                for place in ["Left", "Middle", "Right"] {
+                    ui.label(RichText::new(place).color(Palette::of(ui).text_dim));
+                }
+                ui.end_row();
+                for (name, banner) in [("Header", &mut header), ("Footer", &mut footer)] {
+                    ui.label(RichText::new(name).strong());
+                    for zone in [&mut banner.left, &mut banner.center, &mut banner.right] {
+                        let field = TextEdit::singleline(zone)
+                            .desired_width(150.0)
+                            .margin(widgets::FIELD_MARGIN);
+                        typing |= ui.add_sized(vec2(160.0, 26.0), field).has_focus();
+                    }
+                    ui.end_row();
+                }
+            });
+            ui.add_space(6.0);
+            let hint = "{page} writes the number of the page, {pages} how many there are.";
+            ui.label(RichText::new(hint).small().color(Palette::of(ui).text_dim));
+        });
+        if header != tab.doc.header || footer != tab.doc.footer {
+            // One undo step for all that is typed before leaving the fields.
+            if !std::mem::replace(&mut self.banner_typing, true) {
+                tab.checkpoint(tab.doc.clone());
+            }
+            (tab.doc.header, tab.doc.footer) = (header, footer);
+            tab.touched();
+        } else if !typing {
+            self.banner_typing = false;
+        }
+    }
+
+    /// Where the selected words lead: an address to type, to open or to take away.
+    fn link_window(&mut self, ctx: &Context) {
+        if !self.link_open || self.home {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        // The words the link is on: those selected, or all of the link the caret is in.
+        let caret = tab.selection.start.min(tab.doc.len().saturating_sub(1));
+        let link = tab.doc.formats().get(caret).map_or(0, |format| format.link);
+        let mut words = tab.selection.clone();
+        if words.is_empty() && link != 0 {
+            let linked = |index: &usize| tab.doc.formats()[*index].link == link;
+            let before = (0..caret).rev().take_while(linked).count();
+            let after = (caret..tab.doc.len()).take_while(linked).count();
+            words = caret - before..caret + after;
+        }
+        let (mut apply, mut remove, mut open) = (false, false, false);
+        let url = &mut self.link_url;
+        self.link_open = dialog(ctx, "Link", |ui| {
+            ui.label("Address");
+            let field = TextEdit::singleline(url)
+                .hint_text("https://")
+                .desired_width(340.0)
+                .margin(widgets::FIELD_MARGIN);
+            let typed = ui.add(field);
+            apply = typed.lost_focus() && ui.input(|input| input.key_pressed(Key::Enter));
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                apply |= ui.button("Apply").clicked();
+                ui.add_enabled_ui(link != 0, |ui| {
+                    remove = ui.button("Remove link").clicked();
+                    open = ui.button("Open").clicked();
+                });
+            });
+        });
+        if open
+            && let Some(url) = tab.doc.link(link)
+            && let Err(err) = platform::open_url(url)
+        {
+            self.toasts.error(err);
+        }
+        let typed = self.link_url.trim().to_owned();
+        if apply && !typed.is_empty() {
+            // An address without its start is one of the web.
+            let url = if typed.contains(':') {
+                typed
+            } else {
+                format!("https://{typed}")
+            };
+            tab.checkpoint(tab.doc.clone());
+            let link = tab.doc.link_to(&url);
+            let look = move |format: &mut Format| {
+                (format.link, format.color, format.underline) = (link, LINK_COLOR, true);
+            };
+            if words.is_empty() {
+                // Nothing to put it on: the address itself is written.
+                let mut format = tab.typing();
+                look(&mut format);
+                let at = tab.selection.start;
+                tab.doc.replace(at..at, &url, format);
+            } else {
+                tab.doc.restyle(words.clone(), look);
+            }
+            tab.touched();
+            self.link_open = false;
+        } else if remove && !words.is_empty() {
+            tab.checkpoint(tab.doc.clone());
+            tab.doc.restyle(words, |format| {
+                (format.link, format.color, format.underline) = (0, [0, 0, 0], false);
+            });
+            tab.touched();
+            self.link_open = false;
+        }
+    }
+
+    /// What to say about the selected words.
+    fn comment_window(&mut self, ctx: &Context) {
+        if !self.comment_open || self.home {
+            return;
+        }
+        let mut add = false;
+        let text = &mut self.comment_text;
+        self.comment_open = dialog(ctx, "New comment", |ui| {
+            let field = TextEdit::multiline(text)
+                .desired_width(340.0)
+                .desired_rows(4)
+                .margin(widgets::FIELD_MARGIN);
+            ui.add(field).request_focus();
+            ui.add_space(8.0);
+            add = ui.button("Add").clicked();
+        });
+        let said = self.comment_text.trim().to_owned();
+        if !add || said.is_empty() {
+            return;
+        }
+        let tab = &mut self.tabs[self.active];
+        tab.checkpoint(tab.doc.clone());
+        let author = std::env::var("USERNAME").or_else(|_| std::env::var("USER"));
+        let note = tab.doc.add_comment(Comment {
+            author: author.unwrap_or_else(|_| "Me".to_owned()),
+            text: said,
+        });
+        tab.doc
+            .restyle(tab.selection.clone(), |format| format.note = note);
+        tab.touched();
+        self.comment_text.clear();
+        (self.comment_open, self.show_comments) = (false, true);
+    }
+
+    /// The comments of the document, beside it: who said what, to go to or to take away.
+    fn comments_pane(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
+        let palette = Palette::of(ui);
+        let tab = &mut self.tabs[self.active];
+        ui.label(RichText::new("Comments").strong());
+        ui.add_space(6.0);
+        let mut gone = None;
+        let mut any = false;
+        ScrollArea::vertical().auto_shrink(false).show(ui, |ui| {
+            for (index, comment) in tab.doc.comments.iter().enumerate() {
+                let note = u16::try_from(index + 1).unwrap_or(0);
+                // A comment whose words were all taken out is not shown.
+                let Some(about) = tab.doc.noted(note) else {
+                    continue;
+                };
+                any = true;
+                Frame::new()
+                    .fill(palette.surface)
+                    .corner_radius(CornerRadius::same(6))
+                    .inner_margin(Margin::same(8))
+                    .show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        ui.label(RichText::new(&comment.author).strong().size(12.5));
+                        ui.label(&comment.text);
+                        ui.horizontal(|ui| {
+                            if ui.small_button("Show").clicked() {
+                                clicked.push(Cmd::Goto(about.start));
+                            }
+                            if ui.small_button("Delete").clicked() {
+                                gone = Some(note);
+                            }
+                        });
+                    });
+                ui.add_space(6.0);
+            }
+            if !any {
+                let hint = "Select words, then Review > New comment.";
+                ui.label(RichText::new(hint).color(palette.text_dim));
+            }
+        });
+        if let Some(note) = gone {
+            tab.checkpoint(tab.doc.clone());
+            tab.doc.restyle(0..tab.doc.len(), |format| {
+                if format.note == note {
+                    format.note = 0;
+                }
+            });
+            tab.touched();
+        }
+    }
+
+    /// The measures of the paragraphs of the selection, to type or drag: indents, the first
+    /// line, the room above and under, the height of the lines.
+    fn paragraph_window(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        if !self.paragraph_open || self.home {
+            return;
+        }
+        let para = self.tabs[self.active].para();
+        let edit = |edit: Edit| Cmd::Edit(edit);
+        self.paragraph_open = dialog(ctx, "Paragraph", |ui| {
+            let heading = |ui: &mut Ui, name: &str| {
+                ui.add_space(6.0);
+                ui.label(RichText::new(name).strong());
+                ui.end_row();
+            };
+            let grid = egui::Grid::new("paragraph").num_columns(2);
+            grid.spacing(vec2(28.0, 7.0)).show(ui, |ui| {
+                heading(ui, "General");
+                ui.label("Alignment");
+                let aligns = [
+                    ("Left", ParaAlign::Left),
+                    ("Centered", ParaAlign::Center),
+                    ("Right", ParaAlign::Right),
+                    ("Justified", ParaAlign::Justify),
+                ];
+                let shown = aligns.iter().find(|(_, align)| *align == para.align);
+                ComboBox::from_id_salt("para-align")
+                    .selected_text(shown.map_or("Left", |(name, _)| name))
+                    .show_ui(ui, |ui| {
+                        for (name, align) in aligns {
+                            if ui.selectable_label(align == para.align, name).clicked() {
+                                clicked.push(edit(Edit::Align(align)));
+                            }
+                        }
+                    });
+                ui.end_row();
+
+                heading(ui, "Indentation");
+                ui.label("Left");
+                if let Some(left) = length(ui, "left", para.left, 0.0..=20.0) {
+                    clicked.push(edit(Edit::Left(left)));
+                }
+                ui.end_row();
+                ui.label("Right");
+                if let Some(right) = length(ui, "right", para.right, 0.0..=20.0) {
+                    clicked.push(edit(Edit::Right(right)));
+                }
+                ui.end_row();
+                ui.label("Special");
+                let special = match para.first_line {
+                    0 => "(none)",
+                    first if first > 0 => "First line",
+                    _ => "Hanging",
+                };
+                // The first line of a new special indent starts 1.25 cm away.
+                let by = match para.first_line.unsigned_abs() {
+                    0 => 709,
+                    by => by,
+                };
+                let signed = |by: u16| i16::try_from(by).unwrap_or(i16::MAX);
+                ComboBox::from_id_salt("para-special")
+                    .selected_text(special)
+                    .show_ui(ui, |ui| {
+                        let choices = [
+                            ("(none)", 0),
+                            ("First line", signed(by)),
+                            ("Hanging", -signed(by)),
+                        ];
+                        for (name, first) in choices {
+                            if ui.selectable_label(name == special, name).clicked() {
+                                clicked.push(edit(Edit::FirstLine(first)));
+                            }
+                        }
+                    });
+                ui.end_row();
+                ui.label("By");
+                ui.add_enabled_ui(para.first_line != 0, |ui| {
+                    let shown = para.first_line.unsigned_abs();
+                    if let Some(by) = length(ui, "by", shown, 0.0..=20.0) {
+                        let by = signed(by);
+                        let first = if para.first_line < 0 { -by } else { by };
+                        clicked.push(edit(Edit::FirstLine(first)));
+                    }
+                });
+                ui.end_row();
+
+                heading(ui, "Spacing");
+                ui.label("Before");
+                if let Some(before) = points(ui, "before", para.before) {
+                    clicked.push(edit(Edit::Before(before)));
+                }
+                ui.end_row();
+                ui.label("After");
+                if let Some(after) = points(ui, "after", para.after) {
+                    clicked.push(edit(Edit::After(after)));
+                }
+                ui.end_row();
+                ui.label("Line spacing");
+                let lines = para.line_factor();
+                let now = (lines * 100.0).round() as u16;
+                let named = LINE_SPACINGS.iter().find(|(_, line)| *line == now);
+                ComboBox::from_id_salt("para-lines")
+                    .selected_text(named.map_or("Multiple", |(name, _)| name))
+                    .show_ui(ui, |ui| {
+                        for (name, line) in LINE_SPACINGS {
+                            if ui.selectable_label(line == now, name).clicked() {
+                                clicked.push(edit(Edit::Line(line)));
+                            }
+                        }
+                    });
+                ui.end_row();
+                ui.label("At");
+                if let Some(at) = number(ui, "lines", lines, 0.5..=5.0, 0.01, " lines") {
+                    clicked.push(edit(Edit::Line((at * 100.0).round() as u16)));
+                }
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+        });
+    }
+
+    /// The page of the document in front: each margin, the paper and the way it is turned.
+    fn page_window(&mut self, ctx: &Context, clicked: &mut Vec<Cmd>) {
+        if !self.page_open || self.home {
+            return;
+        }
+        let page = self.tabs[self.active].doc.page;
+        let sides = page
+            .margin_points()
+            .map(|side| (side * goddoc_core::TWIPS_PER_POINT).round() as u16);
+        self.page_open = dialog(ctx, "Page setup", |ui| {
+            let grid = egui::Grid::new("page-setup").num_columns(2);
+            grid.spacing(vec2(28.0, 7.0)).show(ui, |ui| {
+                ui.label(RichText::new("Margins").strong());
+                ui.end_row();
+                let names = ["Top", "Right", "Bottom", "Left"];
+                // In the order one reads a page: top, bottom, left, right.
+                for index in [0, 2, 3, 1] {
+                    ui.label(names[index]);
+                    if let Some(side) = length(ui, names[index], sides[index], 0.0..=10.0) {
+                        let mut sides = sides;
+                        sides[index] = side;
+                        clicked.push(Cmd::Margins(sides));
+                    }
+                    ui.end_row();
+                }
+                ui.add_space(6.0);
+                ui.label(RichText::new("Paper").strong());
+                ui.end_row();
+                ui.label("Size");
+                ComboBox::from_id_salt("page-paper")
+                    .selected_text(page.paper.name())
+                    .show_ui(ui, |ui| {
+                        for paper in Paper::ALL {
+                            if ui
+                                .selectable_label(page.paper == paper, paper.name())
+                                .clicked()
+                            {
+                                clicked.push(Cmd::Paper(paper));
+                            }
+                        }
+                    });
+                ui.end_row();
+                ui.label("Orientation");
+                ui.horizontal(|ui| {
+                    for (name, landscape) in [("Portrait", false), ("Landscape", true)] {
+                        if ui
+                            .selectable_label(page.landscape == landscape, name)
+                            .clicked()
+                        {
+                            clicked.push(Cmd::Landscape(landscape));
+                        }
+                    }
+                });
+                ui.end_row();
+            });
+            ui.add_space(4.0);
+        });
+    }
+
+    /// Print the document in front, or (with a path) write it as a PDF there. The pages are
+    /// drawn away from the window, which stays free; [`Self::finish_output`] says how it went.
+    fn output(&mut self, ctx: &Context, pdf: Option<PathBuf>) {
+        if self.working.is_some() {
+            self.toasts
+                .error("Still busy with the last print or export");
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let (doc, name) = (tab.doc.clone(), tab.name.clone());
+        let (fonts, ctx) = (self.fonts.clone(), ctx.clone());
+        let (done, result) = std::sync::mpsc::channel();
+        let work = move || {
+            let said = match pdf {
+                Some(path) => {
+                    let pages = crate::render::render(&doc, fonts, PDF_DPI);
+                    let written = crate::pdf::write(&pages, &path);
+                    written.map(|()| Some(format!("Exported {}", file_name(&path))))
+                }
+                None => print_pages(&name, &doc, fonts),
+            };
+            // The window may be closed by now: then nobody listens.
+            let _ = done.send(said);
+            ctx.request_repaint();
+        };
+        match std::thread::Builder::new()
+            .name("pages".to_owned())
+            .spawn(work)
+        {
+            Ok(_) => {
+                self.working = Some(result);
+                self.toasts.success("Drawing the pages…");
+            }
+            Err(err) => self.toasts.error(format!("Cannot start: {err}")),
+        }
+    }
+
+    /// Say how the print or the export under way went, once it is over.
+    fn finish_output(&mut self) {
+        let Some(result) = &self.working else {
+            return;
+        };
+        let said = match result.try_recv() {
+            Ok(said) => said,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Drawing the pages failed".to_owned())
+            }
+        };
+        self.working = None;
+        match said {
+            Ok(Some(done)) => self.toasts.success(done),
+            Ok(None) => {}
+            Err(err) => self.toasts.error(err),
+        }
+    }
+
+    /// Get the dictionary of the language in use, away from the window.
+    fn load_spelling(&mut self, ctx: &Context) {
+        let language = self.language;
+        let ready = self
+            .spell
+            .as_ref()
+            .is_some_and(|speller| speller.language == language);
+        if ready || self.spell_loading.is_some() {
+            return;
+        }
+        let (done, result) = std::sync::mpsc::channel();
+        let ctx = ctx.clone();
+        let work = move || {
+            let _ = done.send(crate::spell::load(language));
+            ctx.request_repaint();
+        };
+        match std::thread::Builder::new()
+            .name("spelling".to_owned())
+            .spawn(work)
+        {
+            Ok(_) => {
+                self.spell_loading = Some(result);
+                self.toasts
+                    .success(format!("Getting the {} dictionary…", language.name()));
+            }
+            Err(err) => self.toasts.error(format!("Cannot start: {err}")),
+        }
+    }
+
+    /// Take the dictionary once it is there.
+    fn finish_spelling(&mut self) {
+        let Some(result) = &self.spell_loading else {
+            return;
+        };
+        let loaded = match result.try_recv() {
+            Ok(loaded) => loaded,
+            Err(std::sync::mpsc::TryRecvError::Empty) => return,
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                Err("Reading the dictionary failed".to_owned())
+            }
+        };
+        self.spell_loading = None;
+        match loaded {
+            // Another language was picked while this one was coming.
+            Ok(speller) if speller.language != self.language => {}
+            Ok(speller) => {
+                self.toasts
+                    .success(format!("Spelling: {}", speller.language.name()));
+                self.spell = Some(speller);
+            }
+            Err(err) => {
+                self.spelling = false;
+                self.toasts.error(err);
+            }
+        }
+    }
+
+    /// Words, characters and paragraphs of the document in front, in a small window.
+    fn word_count(&mut self, ctx: &Context) {
+        if !self.counting || self.home {
+            return;
+        }
+        let tab = &self.tabs[self.active];
+        let text = tab.doc.text();
+        let letters = text.chars().filter(|letter| *letter != '\n');
+        let spaces = letters
+            .clone()
+            .filter(|letter| letter.is_whitespace())
+            .count();
+        let characters = letters.count();
+        let paragraphs = text.split('\n').filter(|line| !line.trim().is_empty());
+        let counts = [
+            ("Pages", tab.pages),
+            ("Words", tab.doc.word_count()),
+            ("Characters (no spaces)", characters - spaces),
+            ("Characters (with spaces)", characters),
+            ("Paragraphs", paragraphs.count()),
+        ];
+        self.counting = dialog(ctx, "Word count", |ui| {
+            egui::Grid::new("word-count")
+                .num_columns(2)
+                .spacing(vec2(36.0, 8.0))
+                .show(ui, |ui| {
+                    for (what, count) in counts {
+                        ui.label(what);
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            ui.label(RichText::new(count.to_string()).strong());
+                        });
+                        ui.end_row();
+                    }
+                });
         });
     }
 
@@ -1859,7 +3089,7 @@ impl GodApp {
                 let here = start;
                 start += text.chars().count() + 1;
                 let level = match para.kind {
-                    Kind::Normal => continue,
+                    Kind::Normal | Kind::Subtitle | Kind::Quote => continue,
                     Kind::Title | Kind::Heading1 => 0.0,
                     Kind::Heading2 => 1.0,
                     Kind::Heading3 => 2.0,
@@ -1898,6 +3128,7 @@ impl GodApp {
     // ------------------------------------------------------------ page
 
     fn page(&mut self, ui: &mut Ui, clicked: &mut Vec<Cmd>) {
+        self.view_size = ui.available_size();
         let zoom_delta = ui.input(|input| input.zoom_delta());
         if zoom_delta != 1.0 && ui.rect_contains_pointer(ui.max_rect()) {
             self.zoom = (self.zoom * zoom_delta).clamp(*ZOOM_RANGE.start(), *ZOOM_RANGE.end());
@@ -1912,6 +3143,45 @@ impl GodApp {
         let format = tab.current();
         let in_table = tab.para().cell.is_some();
         let picture = tab.view.selected_picture.is_some();
+        // Spelling: the words to mark, looked up again only when the text changed; and other
+        // spellings for the one the caret is in, for the right-click menu.
+        let spelling = self.spelling;
+        match self.spell.as_mut().filter(|_| spelling) {
+            Some(speller) => {
+                use std::hash::{Hash as _, Hasher as _};
+                let mut hasher = std::collections::hash_map::DefaultHasher::new();
+                tab.doc.text().hash(&mut hasher);
+                let stamp = hasher.finish() | 1;
+                if stamp != tab.spelled {
+                    tab.spelled = stamp;
+                    tab.view.misspelled = speller.misspelled(tab.doc.text());
+                    self.suggested = None;
+                }
+                let caret = tab.selection.start;
+                let inside = |word: &&Range<usize>| word.start <= caret && caret <= word.end;
+                let word = tab.view.misspelled.iter().find(inside).cloned();
+                match word {
+                    Some(word)
+                        if self
+                            .suggested
+                            .as_ref()
+                            .is_none_or(|(known, _)| *known != word) =>
+                    {
+                        let letters = tab.doc.text().chars().skip(word.start).take(word.len());
+                        let others = speller.suggest(&letters.collect::<String>());
+                        self.suggested = Some((word, others));
+                    }
+                    Some(_) => {}
+                    None => self.suggested = None,
+                }
+            }
+            None => {
+                tab.spelled = 0;
+                tab.view.misspelled.clear();
+                self.suggested = None;
+            }
+        }
+        let suggestions = self.suggested.as_ref().map(|(_, words)| words.clone());
         let out = editor::show(
             ui,
             tab.editor_id(),
@@ -1921,7 +3191,17 @@ impl GodApp {
             &mut tab.view,
             editor::Hooks {
                 textures: &mut |ctx, image| texture_of(textures, ctx, image),
-                menu: &mut |ui| quick_menu(ui, &palette, format, in_table, picture, clicked),
+                menu: &mut |ui| {
+                    quick_menu(
+                        ui,
+                        &palette,
+                        format,
+                        in_table,
+                        picture,
+                        suggestions.as_deref(),
+                        clicked,
+                    )
+                },
             },
         );
         tab.pages = out.pages;
@@ -1934,6 +3214,34 @@ impl GodApp {
         }
         if tab.contents.is_some() {
             ui.ctx().request_repaint();
+        }
+        let mut selection = out.selection;
+        if let Some(before) = &out.before
+            && tab.tracking
+            && !out.structural
+        {
+            let after = selection
+                .as_ref()
+                .map_or(tab.selection.start, |range| range.start);
+            if let Some(caret) = track(before, &mut tab.doc, tab.selection.start, after) {
+                selection = Some(caret..caret);
+                set_cursor(ui.ctx(), tab.editor_id(), &(caret..caret));
+            }
+        }
+        // Ctrl+click on a link opens it.
+        let clicked_link =
+            ui.input(|input| input.modifiers.command && input.pointer.primary_released());
+        if clicked_link && let Some(caret) = selection.as_ref().filter(|range| range.is_empty()) {
+            let link = tab
+                .doc
+                .formats()
+                .get(caret.start)
+                .map_or(0, |format| format.link);
+            if let Some(url) = tab.doc.link(link)
+                && let Err(err) = platform::open_url(url)
+            {
+                self.toasts.error(err);
+            }
         }
         if let Some(before) = out.before {
             // Typing joins the step in progress; a move or a resize is a step of its own.
@@ -1948,7 +3256,7 @@ impl GodApp {
             };
             tab.dirty = true;
         }
-        if let Some(selection) = out.selection
+        if let Some(selection) = selection
             && selection != tab.selection
         {
             // The caret moved: a format picked for the old place no longer applies.
@@ -2050,31 +3358,34 @@ impl eframe::App for GodApp {
                 .frame(Frame::new().fill(palette.bg))
                 .show(ui, |ui| self.welcome(ui, &mut clicked));
         } else {
-            Panel::top("ribbon-tabs")
-                .frame(
-                    Frame::new()
-                        .fill(palette.bg)
-                        .inner_margin(Margin::symmetric(8, 0)),
-                )
-                .show_separator_line(false)
-                .show(ui, |ui| self.ribbon_tabs(ui));
-            Panel::top("ribbon")
-                .frame(
-                    Frame::new()
-                        .fill(palette.bg)
-                        .inner_margin(Margin::symmetric(10, 0)),
-                )
-                .show(ui, |ui| {
-                    // A window too narrow for all the tools scrolls them sideways.
-                    // Its bar shows as soon as there is something to scroll to, not only under
-                    // the pointer.
-                    ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
-                    ui.spacing_mut().scroll.bar_width = 6.0;
-                    let bar = ScrollArea::horizontal().id_salt("ribbon");
-                    bar.auto_shrink([false, true])
-                        .show(ui, |ui| self.ribbon(ui, &mut clicked));
-                });
-            if self.find.open {
+            let tools = !self.focus;
+            if tools {
+                Panel::top("ribbon-tabs")
+                    .frame(
+                        Frame::new()
+                            .fill(palette.bg)
+                            .inner_margin(Margin::symmetric(8, 0)),
+                    )
+                    .show_separator_line(false)
+                    .show(ui, |ui| self.ribbon_tabs(ui));
+                Panel::top("ribbon")
+                    .frame(
+                        Frame::new()
+                            .fill(palette.bg)
+                            .inner_margin(Margin::symmetric(10, 0)),
+                    )
+                    .show(ui, |ui| {
+                        // A window too narrow for all the tools scrolls them sideways.
+                        // Its bar shows as soon as there is something to scroll to, not only under
+                        // the pointer.
+                        ui.spacing_mut().scroll = egui::style::ScrollStyle::solid();
+                        ui.spacing_mut().scroll.bar_width = 6.0;
+                        let bar = ScrollArea::horizontal().id_salt("ribbon");
+                        bar.auto_shrink([false, true])
+                            .show(ui, |ui| self.ribbon(ui, &mut clicked));
+                    });
+            }
+            if tools && self.find.open {
                 Panel::top("find-bar")
                     .frame(
                         Frame::new()
@@ -2083,14 +3394,16 @@ impl eframe::App for GodApp {
                     )
                     .show(ui, |ui| self.find_bar(ui, &mut clicked));
             }
-            Panel::bottom("status")
-                .frame(
-                    Frame::new()
-                        .fill(palette.bg)
-                        .inner_margin(Margin::symmetric(12, 3)),
-                )
-                .show(ui, |ui| self.status_bar(ui, &mut clicked));
-            if self.show_outline {
+            if tools {
+                Panel::bottom("status")
+                    .frame(
+                        Frame::new()
+                            .fill(palette.bg)
+                            .inner_margin(Margin::symmetric(12, 3)),
+                    )
+                    .show(ui, |ui| self.status_bar(ui, &mut clicked));
+            }
+            if tools && self.show_outline {
                 Panel::left("outline")
                     .resizable(true)
                     .default_size(220.0)
@@ -2098,15 +3411,31 @@ impl eframe::App for GodApp {
                     .frame(Frame::new().fill(palette.bg).inner_margin(Margin::same(10)))
                     .show(ui, |ui| self.outline(ui, &mut clicked));
             }
+            if tools && self.show_comments {
+                Panel::right("comments")
+                    .resizable(true)
+                    .default_size(240.0)
+                    .size_range(180.0..=400.0)
+                    .frame(Frame::new().fill(palette.bg).inner_margin(Margin::same(10)))
+                    .show(ui, |ui| self.comments_pane(ui, &mut clicked));
+            }
             CentralPanel::default()
                 .frame(Frame::new().fill(palette.canvas))
                 .show(ui, |ui| self.page(ui, &mut clicked));
         }
 
+        self.finish_output();
+        self.finish_spelling();
+        self.banner_window(&ctx);
+        self.link_window(&ctx);
+        self.comment_window(&ctx);
+        self.paragraph_window(&ctx, &mut clicked);
+        self.page_window(&ctx, &mut clicked);
         for cmd in clicked {
             self.run(&ctx, cmd);
         }
         self.closing_dialog(&ctx);
+        self.word_count(&ctx);
         self.updates.show(&ctx);
         self.toasts.show(&ctx);
     }
@@ -2146,15 +3475,6 @@ fn set_cursor(ctx: &Context, id: Id, range: &Range<usize>) {
         state.cursor.set_char_range(Some(range));
         state.store(ctx, id);
     }
-}
-
-fn divider(ui: &mut Ui, palette: &Palette) {
-    let (rect, _) = ui.allocate_exact_size(vec2(13.0, 22.0), Sense::hover());
-    ui.painter().vline(
-        rect.center().x,
-        rect.y_range(),
-        Stroke::new(1.0, palette.border),
-    );
 }
 
 /// Round color dot; the current one gets a ring.
@@ -2327,7 +3647,7 @@ fn ribbon_button(ui: &mut Ui, palette: &Palette, glyph: &str, label: &str, on: b
     let galley = ui
         .painter()
         .layout_no_wrap(label.to_owned(), FontId::proportional(11.5), color);
-    let size = vec2((galley.size().x + 14.0).max(50.0), BAR_HEIGHT - 8.0);
+    let size = vec2((galley.size().x + 14.0).max(50.0), TOOL_HEIGHT);
     let (rect, response) = ui.allocate_exact_size(size, Sense::click());
     let painter = ui.painter();
     let fill = if on {
@@ -2365,6 +3685,306 @@ fn tool(
     }
 }
 
+/// Twentieths of a point in a centimetre.
+const TWIPS_PER_CM: f32 = 566.93;
+/// Line spacings with a name, in hundredths of single spacing.
+const LINE_SPACINGS: [(&str, u16); 4] = [
+    ("Single", 100),
+    ("1.15 lines", 115),
+    ("1.5 lines", 150),
+    ("Double", 200),
+];
+
+/// A number to type or to drag. Gives the new one once it is settled: at the end of a
+/// drag, not at each of its steps, so that undoing takes it back in one go.
+fn number(
+    ui: &mut Ui,
+    salt: &str,
+    value: f32,
+    range: std::ops::RangeInclusive<f32>,
+    speed: f32,
+    unit: &str,
+) -> Option<f32> {
+    let id = ui.id().with(("measure", salt));
+    // While it is dragged, the number shown is the one of the drag.
+    let mut shown = ui.data(|data| data.get_temp::<f32>(id)).unwrap_or(value);
+    let field = egui::DragValue::new(&mut shown)
+        .range(range)
+        .speed(speed)
+        .max_decimals(2)
+        .suffix(unit);
+    // As tall as the other tools around it.
+    let size = vec2(84.0, ui.spacing().interact_size.y.max(18.0));
+    let response = ui.add_sized(size, field);
+    if response.dragged() {
+        ui.data_mut(|data| data.insert_temp(id, shown));
+        return None;
+    }
+    let dragged = ui.data_mut(|data| data.remove_temp::<f32>(id));
+    let settled = dragged.or(response.changed().then_some(shown));
+    settled.filter(|settled| (settled - value).abs() > f32::EPSILON)
+}
+
+/// A length to type or drag, in centimetres; it is kept in twentieths of a point.
+fn length(
+    ui: &mut Ui,
+    salt: &str,
+    twips: u16,
+    range: std::ops::RangeInclusive<f32>,
+) -> Option<u16> {
+    let shown = (f32::from(twips) / TWIPS_PER_CM * 100.0).round() / 100.0;
+    number(ui, salt, shown, range, 0.02, " cm").map(|cm| (cm * TWIPS_PER_CM).round() as u16)
+}
+
+/// A room above or under a paragraph to type or drag, in points.
+fn points(ui: &mut Ui, salt: &str, twips: u16) -> Option<u16> {
+    let shown = f32::from(twips) / goddoc_core::TWIPS_PER_POINT;
+    let typed = number(ui, salt, shown, 0.0..=200.0, 0.2, " pt");
+    typed.map(|points| (points * goddoc_core::TWIPS_PER_POINT).round() as u16)
+}
+
+/// Dots per inch the pages of a PDF are drawn at, and those sent to a printer.
+const PDF_DPI: f32 = 200.0;
+#[cfg(windows)]
+const PRINT_DPI: f32 = 300.0;
+
+/// Print `doc` through the print dialog of the system. `None` when it was called off.
+#[cfg(windows)]
+fn print_pages(
+    name: &str,
+    doc: &Document,
+    fonts: egui::FontDefinitions,
+) -> Result<Option<String>, String> {
+    let pages = crate::render::render(doc, fonts, PRINT_DPI);
+    let printed = crate::print::print(name, pages.pages, |page| pages.page(page));
+    printed.map(|said| said.map(str::to_owned))
+}
+
+#[cfg(not(windows))]
+fn print_pages(
+    _name: &str,
+    _doc: &Document,
+    _fonts: egui::FontDefinitions,
+) -> Result<Option<String>, String> {
+    Err("Printing is only there on Windows for now: export a PDF and print it".to_owned())
+}
+
+/// A small window over the document, which greys what is behind it. Gives false once it is
+/// closed: by its button, by Esc or by a click beside it.
+fn dialog(ctx: &Context, title: &str, content: impl FnOnce(&mut Ui)) -> bool {
+    let mut open = true;
+    let response = egui::Modal::new(Id::new(("dialog", title))).show(ctx, |ui| {
+        ui.heading(title);
+        ui.add_space(8.0);
+        content(ui);
+        ui.add_space(10.0);
+        if ui.button("Close").clicked() {
+            open = false;
+        }
+    });
+    open && !response.should_close()
+}
+
+/// Colour of the words of a link.
+const LINK_COLOR: [u8; 3] = [0x05, 0x63, 0xC1];
+
+/// Mark as tracked what an edit made of `doc` (it was `before`, the caret at `caret`): what it
+/// put in is marked as put in, and what it took out comes back, marked as taken out. Gives
+/// where the caret goes when text came back.
+fn track(before: &Document, doc: &mut Document, caret: usize, after: usize) -> Option<usize> {
+    let old: Vec<char> = before.text().chars().collect();
+    let new: Vec<char> = doc.text().chars().collect();
+    let prefix = old.iter().zip(&new).take_while(|(a, b)| a == b).count();
+    let longest = old.len().min(new.len()) - prefix;
+    let tails = old.iter().rev().zip(new.iter().rev());
+    let suffix = tails.take_while(|(a, b)| a == b).count().min(longest);
+    let removed = prefix..old.len() - suffix;
+    let added = prefix..new.len() - suffix;
+    doc.restyle(added.clone(), |format| format.change = Change::Inserted);
+    // A paragraph taken out is gone for good: what it was like cannot come back with it.
+    if removed.is_empty() || old[removed.clone()].contains(&'\n') {
+        return None;
+    }
+    let mut at = prefix;
+    let mut start = removed.start;
+    for run in before.formats()[removed].chunk_by(|a, b| a == b) {
+        let text: String = old[start..start + run.len()].iter().collect();
+        start += run.len();
+        // What had only just been put in goes for good.
+        if run[0].change != Change::Inserted {
+            let format = Format {
+                change: Change::Deleted,
+                ..run[0]
+            };
+            doc.replace(at..at, &text, format);
+            at += run.len();
+        }
+    }
+    let back = at - prefix;
+    // Delete took what follows the caret: the caret goes past it. Backspace took what is
+    // before: it stays in front. Typing over a selection: it stays after what was typed.
+    let forward = caret == prefix && added.is_empty();
+    let moved = if forward || after > prefix { back } else { 0 };
+    (back > 0).then_some(if forward {
+        prefix + back
+    } else {
+        after + moved
+    })
+}
+
+/// A named group of large ribbon buttons, side by side.
+fn tools(ui: &mut Ui, palette: &Palette, name: &str, buttons: impl FnOnce(&mut Ui)) {
+    group(ui, palette, name, |ui| {
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            buttons(ui);
+        });
+    });
+}
+
+/// A named group of the ribbon: its tools, its name under them, a line after it.
+fn group(ui: &mut Ui, palette: &Palette, name: &str, tools: impl FnOnce(&mut Ui)) {
+    let height = GROUP_TOOLS + GROUP_NAME;
+    let name = ui.painter().layout_no_wrap(
+        name.to_owned(),
+        FontId::proportional(11.0),
+        palette.text_dim,
+    );
+    let inner = ui.vertical(|ui| {
+        ui.spacing_mut().item_spacing = vec2(2.0, 4.0);
+        ui.set_height(height);
+        // A group is at least as wide as its name.
+        ui.set_min_width(name.size().x + 8.0);
+        tools(ui);
+    });
+    let rect = inner.response.rect;
+    let at = pos2(
+        rect.center().x - name.size().x / 2.0,
+        rect.max.y - name.size().y,
+    );
+    ui.painter().galley(at, name, palette.text_dim);
+    let (line, _) = ui.allocate_exact_size(vec2(13.0, height - 10.0), Sense::hover());
+    ui.painter().vline(
+        line.center().x,
+        line.y_range(),
+        Stroke::new(1.0, palette.border),
+    );
+}
+
+/// Small ribbon button: an icon beside its label; `on` shows it pressed.
+fn mini_tool(ui: &mut Ui, glyph: &str, label: &str, tip: &str, on: bool) -> Response {
+    let text = RichText::new(with_icon(glyph, label)).size(12.5);
+    let button = Button::selectable(on, text)
+        .frame_when_inactive(on)
+        .stroke(Stroke::NONE)
+        .min_size(vec2(0.0, 18.0));
+    // Three of them stand in the height of a group.
+    let added = ui.scope(|ui| {
+        ui.spacing_mut().button_padding = vec2(4.0, 0.0);
+        ui.spacing_mut().interact_size.y = 18.0;
+        ui.add(button)
+    });
+    added.inner.on_hover_text(tip)
+}
+
+/// A tool that opens colours to pick from: its glyph over a bar of the colour in use
+/// (`None`: no colour), a small arrow beside them.
+fn color_tool(
+    ui: &mut Ui,
+    palette: &Palette,
+    glyph: &str,
+    tip: &str,
+    shown: Option<[u8; 3]>,
+) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(38.0, 28.0), Sense::click());
+    let painter = ui.painter();
+    if response.hovered() {
+        painter.rect_filled(rect, CornerRadius::same(6), palette.hover);
+    }
+    let middle = pos2(rect.min.x + 14.0, rect.center().y);
+    painter.text(
+        middle - vec2(0.0, 3.0),
+        Align2::CENTER_CENTER,
+        glyph,
+        FontId::proportional(15.0),
+        palette.text,
+    );
+    let bar = Rect::from_center_size(middle + vec2(0.0, 9.0), vec2(16.0, 3.5));
+    match shown {
+        Some([r, g, b]) => {
+            painter.rect_filled(bar, CornerRadius::same(1), Color32::from_rgb(r, g, b))
+        }
+        None => painter.rect_stroke(
+            bar,
+            CornerRadius::same(1),
+            Stroke::new(1.0, palette.border),
+            egui::StrokeKind::Inside,
+        ),
+    };
+    painter.text(
+        pos2(rect.max.x - 8.0, rect.center().y),
+        Align2::CENTER_CENTER,
+        icon::CARET_DOWN,
+        FontId::proportional(9.0),
+        palette.text_dim,
+    );
+    response.on_hover_text(tip)
+}
+
+/// A paragraph style to pick: a few letters as it writes them, on paper, over its name.
+fn style_card(ui: &mut Ui, palette: &Palette, kind: Kind, on: bool) -> Response {
+    let (rect, response) = ui.allocate_exact_size(vec2(78.0, GROUP_TOOLS), Sense::click());
+    let painter = ui.painter().with_clip_rect(rect);
+    let edge = if on {
+        Stroke::new(1.5, palette.text)
+    } else if response.hovered() {
+        Stroke::new(1.0, palette.text_dim)
+    } else {
+        Stroke::new(1.0, palette.border)
+    };
+    painter.rect(
+        rect.shrink(1.0),
+        CornerRadius::same(5),
+        Color32::WHITE,
+        edge,
+        egui::StrokeKind::Inside,
+    );
+    let look = kind.format();
+    let [r, g, b] = look.color;
+    let lay = |size: f32| {
+        let mut job = egui::text::LayoutJob::default();
+        job.append(
+            "AaBbCc",
+            0.0,
+            egui::TextFormat {
+                font_id: FontId::new(size, layout::family(look.font, look.bold)),
+                color: Color32::from_rgb(r, g, b),
+                italics: look.italic,
+                ..Default::default()
+            },
+        );
+        ui.painter().layout_job(job)
+    };
+    // As large as the style writes, as long as the letters stay on the card.
+    let (size, room) = (look.size.clamp(11.0, 19.0), rect.width() - 14.0);
+    let mut letters = lay(size);
+    if letters.size().x > room {
+        letters = lay(size * room / letters.size().x);
+    }
+    let at = pos2(rect.min.x + 7.0, rect.min.y + 23.0 - letters.size().y / 2.0);
+    painter.galley(at, letters, Color32::BLACK);
+    painter.text(
+        pos2(rect.center().x, rect.max.y - 6.0),
+        Align2::CENTER_BOTTOM,
+        kind.name(),
+        FontId::proportional(10.5),
+        Color32::from_gray(0x40),
+    );
+    response
+        .on_hover_text(format!("Style: {}", kind.name()))
+        .on_hover_cursor(egui::CursorIcon::PointingHand)
+}
+
 /// Highlighter colours to pick from; the first dot removes the highlight.
 fn highlight_swatches(
     ui: &mut Ui,
@@ -2396,9 +4016,25 @@ fn quick_menu(
     format: Format,
     in_table: bool,
     picture: bool,
+    suggestions: Option<&[String]>,
     clicked: &mut Vec<Cmd>,
 ) {
     ui.set_min_width(220.0);
+    // The caret is in a word the dictionary does not know: other spellings come first.
+    if let Some(words) = suggestions {
+        for (choice, word) in words.iter().enumerate() {
+            if ui.button(RichText::new(word).strong()).clicked() {
+                clicked.push(Cmd::Suggest(choice));
+            }
+        }
+        if words.is_empty() {
+            ui.label(RichText::new("No other spelling").color(palette.text_dim));
+        }
+        if ui.button("Ignore this word").clicked() {
+            clicked.push(Cmd::IgnoreWord);
+        }
+        ui.separator();
+    }
     ui.horizontal(|ui| {
         ui.spacing_mut().item_spacing.x = 2.0;
         let toggles = [
@@ -2542,7 +4178,7 @@ fn menu_item(
 }
 
 /// Texture of `image`, decoded (and scaled down when huge) the first time it is shown.
-fn texture_of(
+pub fn texture_of(
     cache: &mut HashMap<usize, Option<TextureHandle>>,
     ctx: &Context,
     image: &Image,
@@ -2645,5 +4281,51 @@ mod tests {
         assert_eq!(civil_date(19_782), (2024, 1, 29));
         assert_eq!(civil_date(19_783), (2024, 2, 1));
         assert_eq!(civil_date(20_736), (2026, 9, 10));
+    }
+}
+
+#[cfg(test)]
+mod tracking {
+    use super::*;
+
+    #[test]
+    fn what_is_typed_and_taken_out_is_marked() {
+        let mut before = Document::default();
+        before.replace(0..0, "one two", Format::default());
+        let change = |doc: &Document, at: usize| doc.formats()[at].change;
+
+        // Backspace at the end: the letter comes back, marked, the caret in front of it.
+        let mut doc = before.clone();
+        doc.replace(6..7, "", Format::default());
+        assert_eq!(track(&before, &mut doc, 7, 6), Some(6));
+        assert_eq!((doc.text(), change(&doc, 6)), ("one two", Change::Deleted));
+
+        // Delete at the start: the caret goes past what came back.
+        let mut doc = before.clone();
+        doc.replace(0..1, "", Format::default());
+        assert_eq!(track(&before, &mut doc, 0, 0), Some(1));
+        assert_eq!(change(&doc, 0), Change::Deleted);
+
+        // Typing: marked as put in, nothing comes back.
+        let mut doc = before.clone();
+        doc.replace(3..3, "X", Format::default());
+        assert_eq!(track(&before, &mut doc, 3, 4), None);
+        assert_eq!(change(&doc, 3), Change::Inserted);
+
+        // Typing over a selection: the old words stay, struck, before the new ones.
+        let mut doc = before.clone();
+        doc.replace(4..7, "X", Format::default());
+        assert_eq!(track(&before, &mut doc, 4, 5), Some(8));
+        assert_eq!(doc.text(), "one twoX");
+        assert_eq!(
+            (change(&doc, 4), change(&doc, 7)),
+            (Change::Deleted, Change::Inserted)
+        );
+
+        // Taking out what was only just put in takes it out for good.
+        let typed = doc.clone();
+        doc.replace(7..8, "", Format::default());
+        assert_eq!(track(&typed, &mut doc, 8, 7), None);
+        assert_eq!(doc.text(), "one two");
     }
 }
