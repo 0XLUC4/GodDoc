@@ -3793,6 +3793,7 @@ impl GodApp {
 
 impl eframe::App for GodApp {
     fn ui(&mut self, ui: &mut Ui, _frame: &mut eframe::Frame) {
+        crate::window::track(ui.ctx());
         let ctx = ui.ctx().clone();
         let mut clicked: Vec<Cmd> = Vec::new();
         self.shortcuts(&ctx, &mut clicked);
@@ -3899,6 +3900,7 @@ impl eframe::App for GodApp {
     }
 
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
+        crate::window::save();
         storage.set_string("dark_mode", if self.dark { "1" } else { "0" }.to_owned());
         storage.set_string("zoom", self.zoom.to_string());
         let outline = if self.show_outline { "1" } else { "0" };

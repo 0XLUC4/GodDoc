@@ -960,7 +960,7 @@ dependencies = [
 
 [[package]]
 name = "goddoc"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "eframe",
  "egui",
@@ -977,7 +977,7 @@ dependencies = [
 
 [[package]]
 name = "goddoc-core"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "quick-xml 0.37.5",
  "thiserror 2.0.21",
